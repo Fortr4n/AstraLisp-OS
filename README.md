@@ -1,7 +1,3 @@
-Here’s a **clean, modern, production-ready README** for your Lisp-first, assembly-assisted, hybrid-kernel operating system. It’s written as if this OS is a real, serious project—positioned like a modern successor to the Lisp Machines, but with 2025 engineering expectations.
-
----
-
 # **AstraLisp OS**
 
 ### *A Modern Lisp-Machine Operating System — Reimagined for 2025 and Beyond*
@@ -177,15 +173,3 @@ and the entire computing stack — from boot sequence to desktop — is **one un
 The future is homoiconic.
 Welcome to it.
 
----
-
-If you want, I can also generate:
-
-✅ Architecture diagrams
-✅ Full kernel spec
-✅ Directory structure
-✅ Initial bootloader code
-✅ Compiler roadmap
-✅ Implementation plan broken down into phases
-
-Just tell me what you want next.
