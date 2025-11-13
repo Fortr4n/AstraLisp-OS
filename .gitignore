@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.iso
+
+# Toolchain
+toolchain/binutils-*
+toolchain/gcc-*
+toolchain/llvm-*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
