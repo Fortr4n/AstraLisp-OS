@@ -6,28 +6,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Lisp object types */
-#define LISP_TYPE_NIL 0
-#define LISP_TYPE_INTEGER 1
-#define LISP_TYPE_SYMBOL 2
-#define LISP_TYPE_CONS 3
-#define LISP_TYPE_STRING 4
-#define LISP_TYPE_FUNCTION 5
-
-/* Lisp object structure */
-struct lisp_object {
-    uint32_t type;
-    union {
-        int64_t integer;
-        char* symbol;
-        struct {
-            struct lisp_object* car;
-            struct lisp_object* cdr;
-        } cons;
-        char* string;
-        void* function;
-    } value;
-};
+/* Forward declaration */
+struct lisp_object;
 
 /* Initialize runtime */
 int runtime_init(void);

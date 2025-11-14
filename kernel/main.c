@@ -10,6 +10,8 @@
 #include "interrupt/idt.h"
 #include "process/scheduler.h"
 #include "process/process.h"
+#include "../runtime/runtime.h"
+#include "lisp/kernel-lisp.h"
 
 /* Forward declarations */
 extern void interrupt_handler(uint32_t interrupt_number, void* stack_frame);
@@ -111,6 +113,22 @@ tags_done:
     /* Initialize kernel heap */
     if (heap_init() != 0) {
         kernel_panic("Failed to initialize heap");
+    }
+    
+    early_printf("Initializing Lisp runtime...\n");
+    
+    /* Initialize Lisp runtime */
+    if (runtime_init() != 0) {
+        kernel_panic("Failed to initialize Lisp runtime");
+    }
+    
+    /* Initialize kernel Lisp interface */
+    if (kernel_lisp_init() != 0) {
+        kernel_panic("Failed to initialize kernel Lisp interface");
+    }
+    
+    if (kernel_lisp_register_functions() != 0) {
+        kernel_panic("Failed to register kernel Lisp functions");
     }
     
     early_printf("Initializing interrupt system...\n");

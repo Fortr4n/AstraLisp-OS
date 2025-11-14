@@ -25,6 +25,12 @@ struct thread {
     struct thread* next;
 };
 
+/* Global process list (for Lisp introspection) */
+extern struct process* process_list;
+extern struct process* current_process;
+extern uint32_t next_pid;
+extern uint32_t next_tid;
+
 /* Create process */
 struct process* process_create(void);
 
