@@ -7,10 +7,10 @@
 #include <stddef.h>
 #include <string.h>
 
-static uint32_t next_pid = 1;
-static uint32_t next_tid = 1;
-static struct process* process_list = NULL;
-static struct process* current_process = NULL;
+uint32_t next_pid = 1;
+uint32_t next_tid = 1;
+struct process* process_list = NULL;
+struct process* current_process = NULL;
 
 /* Create process */
 struct process* process_create(void) {
