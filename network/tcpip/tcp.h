@@ -1,0 +1,154 @@
+/* AstraLisp OS TCP Implementation */
+
+#ifndef TCP_H
+#define TCP_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+/* TCP states */
+typedef enum {
+    TCP_CLOSED = 0,
+    TCP_LISTEN = 1,
+    TCP_SYN_SENT = 2,
+    TCP_SYN_RECEIVED = 3,
+    TCP_ESTABLISHED = 4,
+    TCP_FIN_WAIT_1 = 5,
+    TCP_FIN_WAIT_2 = 6,
+    TCP_CLOSE_WAIT = 7,
+    TCP_CLOSING = 8,
+    TCP_LAST_ACK = 9,
+    TCP_TIME_WAIT = 10
+} tcp_state_t;
+
+/* TCP flags */
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_PSH 0x08
+#define TCP_FLAG_ACK 0x10
+#define TCP_FLAG_URG 0x20
+
+/* TCP header */
+struct tcp_header {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq_num;
+    uint32_t ack_num;
+    uint8_t data_offset:4;
+    uint8_t reserved:3;
+    uint8_t flags:9;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent_ptr;
+    uint8_t options[40];
+};
+
+/* TCP segment */
+struct tcp_segment {
+    struct tcp_header header;
+    uint8_t* data;
+    size_t data_len;
+    uint64_t timestamp;
+    struct tcp_segment* next;
+};
+
+/* TCP connection */
+struct tcp_connection {
+    uint32_t local_addr;
+    uint32_t remote_addr;
+    uint16_t local_port;
+    uint16_t remote_port;
+    tcp_state_t state;
+    
+    /* Sequence numbers */
+    uint32_t send_seq;
+    uint32_t send_una;
+    uint32_t send_next;
+    uint32_t recv_seq;
+    uint32_t recv_next;
+    
+    /* Receive window */
+    uint16_t recv_window;
+    uint16_t recv_window_scale;
+    
+    /* Send window */
+    uint16_t send_window;
+    
+    /* Congestion control */
+    uint32_t cwnd;              /* Congestion window */
+    uint32_t ssthresh;          /* Slow start threshold */
+    uint32_t dup_ack_count;     /* Duplicate ACK counter */
+    uint32_t rtt;               /* Round trip time */
+    uint32_t rtt_var;           /* RTT variance */
+    uint32_t retransmit_timeout;
+    bool in_slow_start;
+    bool in_congestion_avoidance;
+    
+    /* Send buffer */
+    struct tcp_segment* send_queue;
+    struct tcp_segment* send_unacked;
+    size_t send_buffer_size;
+    size_t send_buffer_used;
+    
+    /* Receive buffer */
+    struct tcp_segment* recv_queue;
+    size_t recv_buffer_size;
+    size_t recv_buffer_used;
+    
+    /* Timers */
+    uint64_t retransmit_timer;
+    uint64_t persist_timer;
+    uint64_t keepalive_timer;
+    uint64_t time_wait_timer;
+    
+    /* Statistics */
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint32_t segments_sent;
+    uint32_t segments_received;
+    uint32_t retransmissions;
+    uint32_t duplicate_acks;
+    
+    struct tcp_connection* next;
+};
+
+/* Initialize TCP */
+int tcp_init(void);
+
+/* Create TCP connection */
+struct tcp_connection* tcp_create_connection(uint32_t local_addr, uint16_t local_port,
+                                            uint32_t remote_addr, uint16_t remote_port);
+
+/* Destroy TCP connection */
+void tcp_destroy_connection(struct tcp_connection* conn);
+
+/* Process incoming TCP segment */
+int tcp_process_segment(struct tcp_connection* conn, const struct tcp_header* header,
+                        const uint8_t* data, size_t data_len);
+
+/* Send data */
+int tcp_send(struct tcp_connection* conn, const void* data, size_t len);
+
+/* Receive data */
+int tcp_receive(struct tcp_connection* conn, void* buffer, size_t len);
+
+/* Handle state transitions */
+int tcp_handle_state_transition(struct tcp_connection* conn, const struct tcp_header* header);
+
+/* Calculate TCP checksum */
+uint16_t tcp_calculate_checksum(const struct tcp_header* header, const uint8_t* data,
+                                size_t data_len, uint32_t src_addr, uint32_t dst_addr);
+
+/* Update congestion window */
+void tcp_update_cwnd(struct tcp_connection* conn, bool ack_received, bool timeout);
+
+/* Retransmit segment */
+int tcp_retransmit(struct tcp_connection* conn);
+
+/* Find connection */
+struct tcp_connection* tcp_find_connection(uint32_t local_addr, uint16_t local_port,
+                                          uint32_t remote_addr, uint16_t remote_port);
+
+#endif /* TCP_H */
