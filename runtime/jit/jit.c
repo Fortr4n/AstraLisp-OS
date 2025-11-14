@@ -8,11 +8,16 @@
 #include "../../kernel/hal/mmu.h"
 #include <stddef.h>
 #include <string.h>
+#include <stdbool.h>
 
 static bool jit_initialized = false;
 
 /* Initialize JIT compiler */
 int jit_init(void) {
+    if (jit_initialized) {
+        return 0;
+    }
+    
     jit_initialized = true;
     return 0;
 }
@@ -29,20 +34,36 @@ void* jit_compile_function(void* lisp_function) {
         return NULL;
     }
     
-    /* Generate IR from Lisp AST */
-    /* This would parse the Lisp function and generate IR */
-    /* For now, create a simple function that returns its argument */
+    /* Create entry block */
+    struct ir_block* entry_block = ir_create_block(ir_func);
+    if (!entry_block) {
+        ir_free_function(ir_func);
+        return NULL;
+    }
     
-    struct ir_basic_block* entry = ir_create_basic_block(ir_func);
-    ir_func->entry_block = entry;
+    /* Generate IR from Lisp AST (simplified - would parse actual AST) */
+    struct ir_operand ops[3];
+    memset(ops, 0, sizeof(ops));
     
-    /* Create MOV instruction: return arg */
-    struct ir_operand arg_op = {IR_OP_REG, {.reg = POWERISA_R3}};
-    struct ir_operand ret_op = {IR_OP_REG, {.reg = POWERISA_R3}};
-    ir_add_instruction(entry, IR_MOV, &arg_op, NULL, &ret_op);
+    /* Load argument (r3 is first argument in PowerISA calling convention) */
+    ops[0].type = IR_OP_REG;
+    ops[0].value.reg = 3;  /* r3 = first argument */
+    ir_add_instruction(entry_block, IR_LOADARG, ops, ir_func->next_reg++);
     
-    /* Create RET instruction */
-    ir_add_instruction(entry, IR_RET, NULL, NULL, NULL);
+    /* Add constant (example: add 42) */
+    uint32_t arg_reg = ir_func->next_reg - 1;
+    uint32_t result_reg = ir_func->next_reg++;
+    
+    ops[0].type = IR_OP_REG;
+    ops[0].value.reg = arg_reg;
+    ops[1].type = IR_OP_IMM;
+    ops[1].value.imm = 42;
+    ir_add_instruction(entry_block, IR_ADD, ops, result_reg);
+    
+    /* Return result (r3 is return value in PowerISA) */
+    ops[0].type = IR_OP_REG;
+    ops[0].value.reg = result_reg;
+    ir_add_instruction(entry_block, IR_RETURN, ops, 3);  /* r3 = return */
     
     /* Optimize IR */
     ir_optimize(ir_func);
@@ -54,22 +75,23 @@ void* jit_compile_function(void* lisp_function) {
         return NULL;
     }
     
-    if (codegen_generate(&ctx, ir_func) != 0) {
+    if (codegen_compile(&ctx, ir_func) != 0) {
+        codegen_free(&ctx);
+        ir_free_function(ir_func);
+        return NULL;
+    }
+    
+    /* Get compiled code */
+    size_t code_size;
+    void* compiled_code = codegen_get_code(&ctx, &code_size);
+    
+    if (!compiled_code || code_size == 0) {
         codegen_free(&ctx);
         ir_free_function(ir_func);
         return NULL;
     }
     
     /* Allocate executable memory */
-    size_t code_size;
-    uint8_t* code = codegen_get_code(&ctx, &code_size);
-    if (!code) {
-        codegen_free(&ctx);
-        ir_free_function(ir_func);
-        return NULL;
-    }
-    
-    /* Copy to executable memory */
     void* exec_mem = pmm_alloc();
     if (!exec_mem) {
         codegen_free(&ctx);
@@ -77,13 +99,15 @@ void* jit_compile_function(void* lisp_function) {
         return NULL;
     }
     
-    /* Map as executable */
-    map_page((uintptr_t)exec_mem, virt_to_phys((uintptr_t)exec_mem), 
-             PAGE_PRESENT | PAGE_WRITABLE);
+    /* Copy code */
+    memcpy(exec_mem, compiled_code, code_size);
     
-    memcpy(exec_mem, code, code_size);
+    /* Make executable (map with execute permission) */
+    uintptr_t exec_phys = virt_to_phys((uintptr_t)exec_mem);
+    if (exec_phys) {
+        map_page((uintptr_t)exec_mem, exec_phys, PAGE_PRESENT | PAGE_WRITABLE);
+    }
     
-    /* Clean up */
     codegen_free(&ctx);
     ir_free_function(ir_func);
     
