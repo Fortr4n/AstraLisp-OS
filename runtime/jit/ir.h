@@ -30,7 +30,9 @@ typedef enum {
     IR_LOAD,
     IR_STORE,
     IR_PHI,
-    IR_ALLOCA
+    IR_ALLOCA,
+    IR_LOADARG,
+    IR_RETURN
 } ir_opcode_t;
 
 /* IR operand types */
@@ -38,8 +40,7 @@ typedef enum {
     IR_OP_REG,
     IR_OP_IMM,
     IR_OP_MEM,
-    IR_OP_LABEL,
-    IR_OP_NONE
+    IR_OP_LABEL
 } ir_operand_type_t;
 
 /* IR operand */
@@ -60,20 +61,24 @@ struct ir_operand {
 struct ir_instruction {
     ir_opcode_t opcode;
     struct ir_operand operands[3];
-    uint32_t label;
+    uint32_t result_reg;
+    uint32_t label_id;
     struct ir_instruction* next;
     struct ir_instruction* prev;
 };
 
 /* IR basic block */
-struct ir_basic_block {
+struct ir_block {
     uint32_t block_id;
     struct ir_instruction* instructions;
-    struct ir_basic_block** successors;
-    uint32_t successor_count;
-    struct ir_basic_block** predecessors;
+    struct ir_block** predecessors;
     uint32_t predecessor_count;
+    struct ir_block** successors;
+    uint32_t successor_count;
+    uint32_t live_in[64];
+    uint32_t live_out[64];
     bool visited;
+    struct ir_block* next;
 };
 
 /* IR function */
@@ -81,24 +86,27 @@ struct ir_function {
     char* name;
     uint32_t arg_count;
     uint32_t local_count;
-    struct ir_basic_block* entry_block;
-    struct ir_basic_block* blocks;
+    struct ir_block* entry_block;
+    struct ir_block* blocks;
     uint32_t block_count;
+    uint32_t next_reg;
     uint32_t next_label;
-    struct ir_basic_block* next;
 };
 
 /* Create IR function */
 struct ir_function* ir_create_function(const char* name, uint32_t arg_count);
 
-/* Add instruction to basic block */
-struct ir_instruction* ir_add_instruction(struct ir_basic_block* block, ir_opcode_t opcode,
-                                          struct ir_operand* op1, struct ir_operand* op2, struct ir_operand* op3);
+/* Add instruction to block */
+struct ir_instruction* ir_add_instruction(struct ir_block* block, ir_opcode_t opcode,
+                                           const struct ir_operand* ops, uint32_t result_reg);
 
 /* Create basic block */
-struct ir_basic_block* ir_create_basic_block(struct ir_function* func);
+struct ir_block* ir_create_block(struct ir_function* func);
 
-/* Optimize IR function */
+/* Add edge between blocks */
+void ir_add_edge(struct ir_block* from, struct ir_block* to);
+
+/* Optimize IR */
 int ir_optimize(struct ir_function* func);
 
 /* Free IR function */

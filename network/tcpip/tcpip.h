@@ -9,6 +9,9 @@
 /* IP address */
 typedef uint32_t ip_addr_t;
 
+/* Forward declaration */
+struct tcp_connection;
+
 /* Socket structure */
 struct socket {
     uint32_t fd;
@@ -17,6 +20,7 @@ struct socket {
     ip_addr_t local_addr;
     ip_addr_t remote_addr;
     uint32_t state;
+    void* tcp_conn;  /* TCP connection if TCP socket */
 };
 
 /* Initialize TCP/IP stack */

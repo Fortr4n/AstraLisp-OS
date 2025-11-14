@@ -25,6 +25,12 @@ void gc_mark(void* obj);
 /* Run garbage collection */
 void gc_collect(void);
 
+/* Add root pointer */
+int gc_add_root(void** pointer);
+
+/* Remove root pointer */
+void gc_remove_root(void** pointer);
+
 /* Get GC statistics */
 void gc_get_stats(struct gc_stats* stats);
 
