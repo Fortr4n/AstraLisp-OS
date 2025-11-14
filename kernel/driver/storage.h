@@ -9,11 +9,13 @@
 /* Block device structure */
 struct block_device {
     uint32_t id;
+    char name[64];
     uint32_t block_size;
     uint64_t block_count;
     int (*read)(struct block_device* dev, uint64_t block, void* buffer, size_t count);
     int (*write)(struct block_device* dev, uint64_t block, const void* buffer, size_t count);
     void* private_data;
+    struct block_device* next;
 };
 
 /* Initialize storage drivers */
@@ -27,5 +29,8 @@ int storage_read(struct block_device* dev, uint64_t offset, void* buffer, size_t
 
 /* Write to block device */
 int storage_write(struct block_device* dev, uint64_t offset, const void* buffer, size_t size);
+
+/* Find device by name */
+struct block_device* storage_find_device(const char* name);
 
 #endif /* STORAGE_H */

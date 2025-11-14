@@ -51,3 +51,20 @@ int storage_write(struct block_device* dev, uint64_t offset, const void* buffer,
     
     return dev->write(dev, start_block, buffer, block_count);
 }
+
+/* Find device by name */
+struct block_device* storage_find_device(const char* name) {
+    if (!name) {
+        return NULL;
+    }
+    
+    struct block_device* dev = device_list;
+    while (dev) {
+        if (strncmp(dev->name, name, sizeof(dev->name)) == 0) {
+            return dev;
+        }
+        dev = dev->next;
+    }
+    
+    return NULL;
+}
