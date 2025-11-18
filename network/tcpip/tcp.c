@@ -14,9 +14,650 @@
 #define TCP_INITIAL_SSTHRESH 65535
 #define TCP_RTO_MIN 1000
 #define TCP_RTO_MAX 60000
+#define TCP_REASM_QUEUE_MAX_BYTES (256 * 1024)  /* 256KB max out-of-order buffer */
+
+/* Sequence number comparison macros (handle wraparound) */
+#define SEQ_LT(a, b)  ((int32_t)((a) - (b)) < 0)
+#define SEQ_LEQ(a, b) ((int32_t)((a) - (b)) <= 0)
+#define SEQ_GT(a, b)  ((int32_t)((a) - (b)) > 0)
+#define SEQ_GEQ(a, b) ((int32_t)((a) - (b)) >= 0)
 
 static struct tcp_connection* connection_list = NULL;
 static uint32_t next_local_port = 32768;
+
+/*
+ * ============================================================================
+ * RED-BLACK TREE IMPLEMENTATION FOR OUT-OF-ORDER REASSEMBLY QUEUE
+ * ============================================================================
+ */
+
+/* Create reassembly queue */
+struct reassembly_queue* reasm_queue_create(size_t max_bytes) {
+    struct reassembly_queue* queue = (struct reassembly_queue*)kmalloc(sizeof(struct reassembly_queue));
+    if (!queue) {
+        return NULL;
+    }
+
+    /* Allocate sentinel (nil) node */
+    queue->nil = (struct ooo_segment*)kmalloc(sizeof(struct ooo_segment));
+    if (!queue->nil) {
+        kfree(queue);
+        return NULL;
+    }
+
+    /* Initialize sentinel */
+    memset(queue->nil, 0, sizeof(struct ooo_segment));
+    queue->nil->color = RB_BLACK;
+    queue->nil->parent = queue->nil;
+    queue->nil->left = queue->nil;
+    queue->nil->right = queue->nil;
+
+    /* Initialize queue */
+    queue->root = queue->nil;
+    queue->segment_count = 0;
+    queue->total_bytes = 0;
+    queue->max_bytes = max_bytes;
+
+    return queue;
+}
+
+/* Destroy reassembly queue */
+static void reasm_queue_destroy_subtree(struct reassembly_queue* queue, struct ooo_segment* node) {
+    if (node == queue->nil) {
+        return;
+    }
+
+    reasm_queue_destroy_subtree(queue, node->left);
+    reasm_queue_destroy_subtree(queue, node->right);
+
+    if (node->data) {
+        kfree(node->data);
+    }
+    kfree(node);
+}
+
+void reasm_queue_destroy(struct reassembly_queue* queue) {
+    if (!queue) {
+        return;
+    }
+
+    reasm_queue_destroy_subtree(queue, queue->root);
+    kfree(queue->nil);
+    kfree(queue);
+}
+
+/* Red-Black tree left rotate */
+static void rb_left_rotate(struct reassembly_queue* queue, struct ooo_segment* x) {
+    struct ooo_segment* y = x->right;  /* Set y */
+
+    /* Turn y's left subtree into x's right subtree */
+    x->right = y->left;
+    if (y->left != queue->nil) {
+        y->left->parent = x;
+    }
+
+    /* Link x's parent to y */
+    y->parent = x->parent;
+    if (x->parent == queue->nil) {
+        queue->root = y;
+    } else if (x == x->parent->left) {
+        x->parent->left = y;
+    } else {
+        x->parent->right = y;
+    }
+
+    /* Put x on y's left */
+    y->left = x;
+    x->parent = y;
+}
+
+/* Red-Black tree right rotate */
+static void rb_right_rotate(struct reassembly_queue* queue, struct ooo_segment* x) {
+    struct ooo_segment* y = x->left;  /* Set y */
+
+    /* Turn y's right subtree into x's left subtree */
+    x->left = y->right;
+    if (y->right != queue->nil) {
+        y->right->parent = x;
+    }
+
+    /* Link x's parent to y */
+    y->parent = x->parent;
+    if (x->parent == queue->nil) {
+        queue->root = y;
+    } else if (x == x->parent->right) {
+        x->parent->right = y;
+    } else {
+        x->parent->left = y;
+    }
+
+    /* Put x on y's right */
+    y->right = x;
+    x->parent = y;
+}
+
+/* Red-Black tree insert fixup */
+static void rb_insert_fixup(struct reassembly_queue* queue, struct ooo_segment* z) {
+    while (z->parent->color == RB_RED) {
+        if (z->parent == z->parent->parent->left) {
+            struct ooo_segment* y = z->parent->parent->right;  /* Uncle */
+            if (y->color == RB_RED) {
+                /* Case 1: Uncle is red */
+                z->parent->color = RB_BLACK;
+                y->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->right) {
+                    /* Case 2: z is right child */
+                    z = z->parent;
+                    rb_left_rotate(queue, z);
+                }
+                /* Case 3: z is left child */
+                z->parent->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                rb_right_rotate(queue, z->parent->parent);
+            }
+        } else {
+            /* Same as above with "left" and "right" exchanged */
+            struct ooo_segment* y = z->parent->parent->left;  /* Uncle */
+            if (y->color == RB_RED) {
+                /* Case 1: Uncle is red */
+                z->parent->color = RB_BLACK;
+                y->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->left) {
+                    /* Case 2: z is left child */
+                    z = z->parent;
+                    rb_right_rotate(queue, z);
+                }
+                /* Case 3: z is right child */
+                z->parent->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                rb_left_rotate(queue, z->parent->parent);
+            }
+        }
+    }
+    queue->root->color = RB_BLACK;
+}
+
+/* Insert segment into reassembly queue */
+int reasm_queue_insert(struct reassembly_queue* queue, uint32_t seq_start,
+                       uint32_t seq_end, const uint8_t* data, size_t data_len) {
+    if (!queue || !data || data_len == 0 || seq_start == seq_end) {
+        return -1;
+    }
+
+    /* Check buffer limit */
+    if (queue->total_bytes + data_len > queue->max_bytes) {
+        return -1;  /* Buffer full */
+    }
+
+    /* Allocate new node */
+    struct ooo_segment* z = (struct ooo_segment*)kmalloc(sizeof(struct ooo_segment));
+    if (!z) {
+        return -1;
+    }
+
+    /* Allocate and copy data */
+    z->data = (uint8_t*)kmalloc(data_len);
+    if (!z->data) {
+        kfree(z);
+        return -1;
+    }
+    memcpy(z->data, data, data_len);
+
+    /* Initialize node */
+    z->seq_start = seq_start;
+    z->seq_end = seq_end;
+    z->data_len = data_len;
+    z->timestamp = 0;  /* Would set to current time */
+    z->left = queue->nil;
+    z->right = queue->nil;
+    z->color = RB_RED;
+
+    /* Standard BST insert */
+    struct ooo_segment* y = queue->nil;
+    struct ooo_segment* x = queue->root;
+
+    while (x != queue->nil) {
+        y = x;
+        if (SEQ_LT(z->seq_start, x->seq_start)) {
+            x = x->left;
+        } else {
+            x = x->right;
+        }
+    }
+
+    z->parent = y;
+
+    if (y == queue->nil) {
+        queue->root = z;
+    } else if (SEQ_LT(z->seq_start, y->seq_start)) {
+        y->left = z;
+    } else {
+        y->right = z;
+    }
+
+    /* Fix Red-Black tree properties */
+    rb_insert_fixup(queue, z);
+
+    /* Update statistics */
+    queue->segment_count++;
+    queue->total_bytes += data_len;
+
+    return 0;
+}
+
+/* Find minimum node in subtree */
+static struct ooo_segment* rb_minimum(struct reassembly_queue* queue, struct ooo_segment* x) {
+    while (x->left != queue->nil) {
+        x = x->left;
+    }
+    return x;
+}
+
+/* Red-Black tree transplant */
+static void rb_transplant(struct reassembly_queue* queue, struct ooo_segment* u,
+                         struct ooo_segment* v) {
+    if (u->parent == queue->nil) {
+        queue->root = v;
+    } else if (u == u->parent->left) {
+        u->parent->left = v;
+    } else {
+        u->parent->right = v;
+    }
+    v->parent = u->parent;
+}
+
+/* Red-Black tree delete fixup */
+static void rb_delete_fixup(struct reassembly_queue* queue, struct ooo_segment* x) {
+    while (x != queue->root && x->color == RB_BLACK) {
+        if (x == x->parent->left) {
+            struct ooo_segment* w = x->parent->right;  /* Sibling */
+            if (w->color == RB_RED) {
+                /* Case 1: Sibling is red */
+                w->color = RB_BLACK;
+                x->parent->color = RB_RED;
+                rb_left_rotate(queue, x->parent);
+                w = x->parent->right;
+            }
+            if (w->left->color == RB_BLACK && w->right->color == RB_BLACK) {
+                /* Case 2: Sibling's children are both black */
+                w->color = RB_RED;
+                x = x->parent;
+            } else {
+                if (w->right->color == RB_BLACK) {
+                    /* Case 3: Sibling's right child is black */
+                    w->left->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rb_right_rotate(queue, w);
+                    w = x->parent->right;
+                }
+                /* Case 4: Sibling's right child is red */
+                w->color = x->parent->color;
+                x->parent->color = RB_BLACK;
+                w->right->color = RB_BLACK;
+                rb_left_rotate(queue, x->parent);
+                x = queue->root;
+            }
+        } else {
+            /* Same as above with "left" and "right" exchanged */
+            struct ooo_segment* w = x->parent->left;  /* Sibling */
+            if (w->color == RB_RED) {
+                /* Case 1: Sibling is red */
+                w->color = RB_BLACK;
+                x->parent->color = RB_RED;
+                rb_right_rotate(queue, x->parent);
+                w = x->parent->left;
+            }
+            if (w->right->color == RB_BLACK && w->left->color == RB_BLACK) {
+                /* Case 2: Sibling's children are both black */
+                w->color = RB_RED;
+                x = x->parent;
+            } else {
+                if (w->left->color == RB_BLACK) {
+                    /* Case 3: Sibling's left child is black */
+                    w->right->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rb_left_rotate(queue, w);
+                    w = x->parent->left;
+                }
+                /* Case 4: Sibling's left child is red */
+                w->color = x->parent->color;
+                x->parent->color = RB_BLACK;
+                w->left->color = RB_BLACK;
+                rb_right_rotate(queue, x->parent);
+                x = queue->root;
+            }
+        }
+    }
+    x->color = RB_BLACK;
+}
+
+/* Delete node from Red-Black tree */
+static void rb_delete(struct reassembly_queue* queue, struct ooo_segment* z) {
+    struct ooo_segment* y = z;
+    struct ooo_segment* x;
+    rb_color_t y_original_color = y->color;
+
+    if (z->left == queue->nil) {
+        x = z->right;
+        rb_transplant(queue, z, z->right);
+    } else if (z->right == queue->nil) {
+        x = z->left;
+        rb_transplant(queue, z, z->left);
+    } else {
+        y = rb_minimum(queue, z->right);
+        y_original_color = y->color;
+        x = y->right;
+        if (y->parent == z) {
+            x->parent = y;
+        } else {
+            rb_transplant(queue, y, y->right);
+            y->right = z->right;
+            y->right->parent = y;
+        }
+        rb_transplant(queue, z, y);
+        y->left = z->left;
+        y->left->parent = y;
+        y->color = z->color;
+    }
+
+    if (y_original_color == RB_BLACK) {
+        rb_delete_fixup(queue, x);
+    }
+
+    /* Update statistics */
+    queue->segment_count--;
+    queue->total_bytes -= z->data_len;
+
+    /* Free node */
+    if (z->data) {
+        kfree(z->data);
+    }
+    kfree(z);
+}
+
+/* Extract ready segments (those starting at recv_next) */
+struct ooo_segment* reasm_queue_extract_ready(struct reassembly_queue* queue,
+                                              uint32_t recv_next) {
+    if (!queue || queue->root == queue->nil) {
+        return NULL;
+    }
+
+    /* Find leftmost segment */
+    struct ooo_segment* node = rb_minimum(queue, queue->root);
+
+    /* Check if it starts at recv_next */
+    if (node->seq_start != recv_next) {
+        return NULL;  /* Gap exists */
+    }
+
+    /* Extract the segment */
+    struct ooo_segment* result = (struct ooo_segment*)kmalloc(sizeof(struct ooo_segment));
+    if (!result) {
+        return NULL;
+    }
+
+    /* Copy segment data */
+    *result = *node;
+    result->data = (uint8_t*)kmalloc(node->data_len);
+    if (!result->data) {
+        kfree(result);
+        return NULL;
+    }
+    memcpy(result->data, node->data, node->data_len);
+
+    /* Remove from tree */
+    rb_delete(queue, node);
+
+    /* Mark as standalone node */
+    result->left = NULL;
+    result->right = NULL;
+    result->parent = NULL;
+
+    return result;
+}
+
+/* Remove all segments with sequence numbers below seq */
+void reasm_queue_remove_below(struct reassembly_queue* queue, uint32_t seq) {
+    if (!queue) {
+        return;
+    }
+
+    /* Traverse tree and collect nodes to delete */
+    struct ooo_segment* to_delete[1024];  /* Max segments to delete at once */
+    uint32_t delete_count = 0;
+
+    struct ooo_segment* node = queue->root;
+    while (node != queue->nil && delete_count < 1024) {
+        if (SEQ_LT(node->seq_end, seq)) {
+            /* This entire segment is below seq */
+            to_delete[delete_count++] = node;
+            node = node->right;
+        } else if (SEQ_LT(node->seq_start, seq)) {
+            /* Partial overlap - shouldn't normally happen */
+            to_delete[delete_count++] = node;
+            node = node->right;
+        } else {
+            /* This segment is above seq, check left subtree */
+            node = node->left;
+        }
+    }
+
+    /* Delete collected nodes */
+    for (uint32_t i = 0; i < delete_count; i++) {
+        rb_delete(queue, to_delete[i]);
+    }
+}
+
+/*
+ * ============================================================================
+ * SACK (SELECTIVE ACKNOWLEDGMENT) IMPLEMENTATION - RFC 2018
+ * ============================================================================
+ */
+
+/* Generate SACK blocks from reassembly queue */
+void tcp_generate_sack_blocks(struct tcp_connection* conn) {
+    if (!conn || !conn->reasm_queue || !conn->sack_permitted) {
+        return;
+    }
+
+    struct reassembly_queue* queue = conn->reasm_queue;
+    conn->sack_block_count = 0;
+
+    if (queue->root == queue->nil) {
+        return;  /* No out-of-order segments */
+    }
+
+    /* In-order traversal to collect contiguous blocks */
+    struct ooo_segment* stack[256];
+    int stack_top = -1;
+    struct ooo_segment* current = queue->root;
+
+    uint32_t current_left = 0;
+    uint32_t current_right = 0;
+    bool in_block = false;
+
+    /* In-order traversal */
+    while (stack_top >= 0 || current != queue->nil) {
+        if (current != queue->nil) {
+            stack[++stack_top] = current;
+            current = current->left;
+        } else {
+            current = stack[stack_top--];
+
+            if (!in_block) {
+                /* Start new block */
+                current_left = current->seq_start;
+                current_right = current->seq_end;
+                in_block = true;
+            } else {
+                /* Check if contiguous with current block */
+                if (current->seq_start == current_right) {
+                    /* Extend block */
+                    current_right = current->seq_end;
+                } else {
+                    /* Gap found - save current block */
+                    if (conn->sack_block_count < TCP_MAX_SACK_BLOCKS) {
+                        conn->sack_blocks[conn->sack_block_count].left_edge = current_left;
+                        conn->sack_blocks[conn->sack_block_count].right_edge = current_right;
+                        conn->sack_block_count++;
+                    }
+
+                    /* Start new block */
+                    current_left = current->seq_start;
+                    current_right = current->seq_end;
+                }
+            }
+
+            current = current->right;
+        }
+    }
+
+    /* Save last block */
+    if (in_block && conn->sack_block_count < TCP_MAX_SACK_BLOCKS) {
+        conn->sack_blocks[conn->sack_block_count].left_edge = current_left;
+        conn->sack_blocks[conn->sack_block_count].right_edge = current_right;
+        conn->sack_block_count++;
+    }
+}
+
+/* Add SACK option to TCP header */
+int tcp_add_sack_option(struct tcp_header* header, const struct tcp_sack_block* blocks,
+                        uint32_t block_count) {
+    if (!header || !blocks || block_count == 0 || block_count > TCP_MAX_SACK_BLOCKS) {
+        return -1;
+    }
+
+    uint8_t* options = header->options;
+    size_t offset = 0;
+
+    /* Find end of existing options */
+    while (offset < 40 && options[offset] != TCP_OPT_END) {
+        if (options[offset] == TCP_OPT_NOP) {
+            offset++;
+        } else {
+            uint8_t len = options[offset + 1];
+            if (len < 2 || offset + len > 40) {
+                break;
+            }
+            offset += len;
+        }
+    }
+
+    /* Calculate SACK option length */
+    size_t sack_len = 2 + (block_count * 8);  /* Kind + Length + (8 bytes per block) */
+
+    if (offset + sack_len > 40) {
+        return -1;  /* Not enough space */
+    }
+
+    /* Add SACK option */
+    options[offset++] = TCP_OPT_SACK;
+    options[offset++] = (uint8_t)sack_len;
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        /* Left edge (4 bytes, network byte order) */
+        uint32_t left = blocks[i].left_edge;
+        options[offset++] = (left >> 24) & 0xFF;
+        options[offset++] = (left >> 16) & 0xFF;
+        options[offset++] = (left >> 8) & 0xFF;
+        options[offset++] = left & 0xFF;
+
+        /* Right edge (4 bytes, network byte order) */
+        uint32_t right = blocks[i].right_edge;
+        options[offset++] = (right >> 24) & 0xFF;
+        options[offset++] = (right >> 16) & 0xFF;
+        options[offset++] = (right >> 8) & 0xFF;
+        options[offset++] = right & 0xFF;
+    }
+
+    /* Add END option */
+    if (offset < 40) {
+        options[offset] = TCP_OPT_END;
+    }
+
+    /* Update data offset (in 32-bit words) */
+    header->data_offset = 5 + ((offset + 3) / 4);
+
+    return 0;
+}
+
+/* Parse SACK option from TCP header */
+int tcp_parse_sack_option(const uint8_t* options, size_t options_len,
+                          struct tcp_sack_block* blocks, uint32_t* block_count) {
+    if (!options || !blocks || !block_count) {
+        return -1;
+    }
+
+    *block_count = 0;
+    size_t offset = 0;
+
+    while (offset < options_len) {
+        uint8_t kind = options[offset];
+
+        if (kind == TCP_OPT_END) {
+            break;
+        }
+
+        if (kind == TCP_OPT_NOP) {
+            offset++;
+            continue;
+        }
+
+        if (offset + 1 >= options_len) {
+            break;  /* Invalid option */
+        }
+
+        uint8_t len = options[offset + 1];
+        if (len < 2 || offset + len > options_len) {
+            break;  /* Invalid length */
+        }
+
+        if (kind == TCP_OPT_SACK) {
+            /* Parse SACK blocks */
+            size_t block_bytes = len - 2;
+            if (block_bytes % 8 != 0) {
+                return -1;  /* Invalid SACK option */
+            }
+
+            uint32_t num_blocks = block_bytes / 8;
+            if (num_blocks > TCP_MAX_SACK_BLOCKS) {
+                num_blocks = TCP_MAX_SACK_BLOCKS;
+            }
+
+            for (uint32_t i = 0; i < num_blocks; i++) {
+                size_t block_offset = offset + 2 + (i * 8);
+
+                /* Parse left edge */
+                uint32_t left = ((uint32_t)options[block_offset] << 24) |
+                               ((uint32_t)options[block_offset + 1] << 16) |
+                               ((uint32_t)options[block_offset + 2] << 8) |
+                               ((uint32_t)options[block_offset + 3]);
+
+                /* Parse right edge */
+                uint32_t right = ((uint32_t)options[block_offset + 4] << 24) |
+                                ((uint32_t)options[block_offset + 5] << 16) |
+                                ((uint32_t)options[block_offset + 6] << 8) |
+                                ((uint32_t)options[block_offset + 7]);
+
+                blocks[*block_count].left_edge = left;
+                blocks[*block_count].right_edge = right;
+                (*block_count)++;
+            }
+
+            return 0;  /* SACK option found and parsed */
+        }
+
+        offset += len;
+    }
+
+    return -1;  /* SACK option not found */
+}
 
 /* Calculate TCP checksum */
 uint16_t tcp_calculate_checksum(const struct tcp_header* header, const uint8_t* data,
@@ -73,10 +714,15 @@ static int tcp_send_segment(struct tcp_connection* conn, uint8_t flags,
     segment->header.dst_port = conn->remote_port;
     segment->header.seq_num = conn->send_seq;
     segment->header.ack_num = conn->recv_next;
-    segment->header.data_offset = 5;  /* 20 bytes header */
+    segment->header.data_offset = 5;  /* 20 bytes header (may be updated by options) */
     segment->header.flags = flags;
     segment->header.window = conn->recv_window;
     segment->header.urgent_ptr = 0;
+
+    /* Add SACK options if this is an ACK and we have SACK blocks */
+    if ((flags & TCP_FLAG_ACK) && conn->sack_permitted && conn->sack_block_count > 0) {
+        tcp_add_sack_option(&segment->header, conn->sack_blocks, conn->sack_block_count);
+    }
     
     if (data && data_len > 0) {
         segment->data = (uint8_t*)kmalloc(data_len);
@@ -380,8 +1026,11 @@ int tcp_process_segment(struct tcp_connection* conn, const struct tcp_header* he
     
     /* Handle data */
     if (data_len > 0) {
-        if (header->seq_num == conn->recv_next) {
-            /* In-order data */
+        uint32_t seq_start = header->seq_num;
+        uint32_t seq_end = seq_start + data_len;
+
+        if (seq_start == conn->recv_next) {
+            /* In-order data - add to receive queue */
             struct tcp_segment* segment = (struct tcp_segment*)kmalloc(sizeof(struct tcp_segment));
             if (segment) {
                 memcpy(&segment->header, header, sizeof(struct tcp_header));
@@ -391,19 +1040,130 @@ int tcp_process_segment(struct tcp_connection* conn, const struct tcp_header* he
                     segment->data_len = data_len;
                     segment->next = conn->recv_queue;
                     conn->recv_queue = segment;
-                    conn->recv_next += data_len;
+                    conn->recv_next = seq_end;
                     conn->recv_buffer_used += data_len;
                     conn->bytes_received += data_len;
+
+                    /* Check reassembly queue for segments that are now in-order */
+                    if (conn->reasm_queue) {
+                        struct ooo_segment* ooo_seg = reasm_queue_extract_ready(
+                            conn->reasm_queue, conn->recv_next);
+
+                        while (ooo_seg) {
+                            /* Add to receive queue */
+                            struct tcp_segment* in_order_seg = (struct tcp_segment*)kmalloc(
+                                sizeof(struct tcp_segment));
+                            if (in_order_seg) {
+                                memset(&in_order_seg->header, 0, sizeof(struct tcp_header));
+                                in_order_seg->data = ooo_seg->data;
+                                in_order_seg->data_len = ooo_seg->data_len;
+                                in_order_seg->next = conn->recv_queue;
+                                conn->recv_queue = in_order_seg;
+                                conn->recv_next = ooo_seg->seq_end;
+                                conn->recv_buffer_used += ooo_seg->data_len;
+                                conn->bytes_received += ooo_seg->data_len;
+
+                                /* Don't free data - transferred to receive queue */
+                                kfree(ooo_seg);
+                            } else {
+                                /* Failed to allocate - free segment */
+                                if (ooo_seg->data) {
+                                    kfree(ooo_seg->data);
+                                }
+                                kfree(ooo_seg);
+                                break;
+                            }
+
+                            /* Try next segment */
+                            ooo_seg = reasm_queue_extract_ready(conn->reasm_queue,
+                                                                conn->recv_next);
+                        }
+                    }
                 } else {
                     kfree(segment);
                 }
             }
-            
-            /* Send ACK */
+
+            /* Generate SACK blocks and send ACK */
+            if (conn->sack_permitted) {
+                tcp_generate_sack_blocks(conn);
+            }
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+
+        } else if (SEQ_GT(seq_start, conn->recv_next)) {
+            /* Out-of-order data - add to reassembly queue */
+            if (conn->reasm_queue) {
+                /* Check for duplicate or overlapping segment */
+                if (SEQ_LEQ(seq_end, conn->recv_next)) {
+                    /* Old duplicate - ignore */
+                } else {
+                    /* Trim overlap with already received data */
+                    uint32_t trim_start = seq_start;
+                    const uint8_t* trim_data = data;
+                    size_t trim_len = data_len;
+
+                    if (SEQ_LT(seq_start, conn->recv_next)) {
+                        /* Partial overlap with received data */
+                        uint32_t overlap = conn->recv_next - seq_start;
+                        trim_start = conn->recv_next;
+                        trim_data = data + overlap;
+                        trim_len = data_len - overlap;
+                    }
+
+                    /* Insert into reassembly queue */
+                    int result = reasm_queue_insert(conn->reasm_queue, trim_start,
+                                                   trim_start + trim_len, trim_data,
+                                                   trim_len);
+
+                    if (result == 0) {
+                        /* Successfully buffered - generate SACK blocks */
+                        if (conn->sack_permitted) {
+                            tcp_generate_sack_blocks(conn);
+                        }
+
+                        /* Send duplicate ACK with SACK info */
+                        tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+                        conn->duplicate_acks++;
+                    } else {
+                        /* Buffer full or allocation failed - drop segment */
+                        /* Sender will retransmit based on timeout */
+                    }
+                }
+            }
+
         } else {
-            /* Out-of-order data - buffer for now */
-            /* Full implementation would handle out-of-order segments */
+            /* seq_start < recv_next: Old duplicate or retransmission */
+            if (SEQ_GT(seq_end, conn->recv_next)) {
+                /* Partial retransmission with new data */
+                uint32_t overlap = conn->recv_next - seq_start;
+                if (overlap < data_len) {
+                    /* Process new portion */
+                    const uint8_t* new_data = data + overlap;
+                    size_t new_len = data_len - overlap;
+
+                    struct tcp_segment* segment = (struct tcp_segment*)kmalloc(
+                        sizeof(struct tcp_segment));
+                    if (segment) {
+                        memcpy(&segment->header, header, sizeof(struct tcp_header));
+                        segment->data = (uint8_t*)kmalloc(new_len);
+                        if (segment->data) {
+                            memcpy(segment->data, new_data, new_len);
+                            segment->data_len = new_len;
+                            segment->next = conn->recv_queue;
+                            conn->recv_queue = segment;
+                            conn->recv_next += new_len;
+                            conn->recv_buffer_used += new_len;
+                            conn->bytes_received += new_len;
+                        } else {
+                            kfree(segment);
+                        }
+                    }
+                }
+            }
+
+            /* Send duplicate ACK (already received this data) */
+            tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            conn->duplicate_acks++;
         }
     }
     
@@ -541,11 +1301,22 @@ struct tcp_connection* tcp_create_connection(uint32_t local_addr, uint16_t local
     /* Initialize buffers */
     conn->send_buffer_size = 65535;
     conn->recv_buffer_size = 65535;
-    
+
+    /* Initialize reassembly queue */
+    conn->reasm_queue = reasm_queue_create(TCP_REASM_QUEUE_MAX_BYTES);
+    if (!conn->reasm_queue) {
+        kfree(conn);
+        return NULL;
+    }
+
+    /* Initialize SACK support */
+    conn->sack_permitted = true;  /* Enable SACK by default */
+    conn->sack_block_count = 0;
+
     /* Add to connection list */
     conn->next = connection_list;
     connection_list = conn;
-    
+
     return conn;
 }
 
@@ -554,7 +1325,7 @@ void tcp_destroy_connection(struct tcp_connection* conn) {
     if (!conn) {
         return;
     }
-    
+
     /* Free send queue */
     struct tcp_segment* seg = conn->send_queue;
     while (seg) {
@@ -565,7 +1336,18 @@ void tcp_destroy_connection(struct tcp_connection* conn) {
         kfree(seg);
         seg = next;
     }
-    
+
+    /* Free send unacked queue */
+    seg = conn->send_unacked;
+    while (seg) {
+        struct tcp_segment* next = seg->next;
+        if (seg->data) {
+            kfree(seg->data);
+        }
+        kfree(seg);
+        seg = next;
+    }
+
     /* Free receive queue */
     seg = conn->recv_queue;
     while (seg) {
@@ -576,7 +1358,12 @@ void tcp_destroy_connection(struct tcp_connection* conn) {
         kfree(seg);
         seg = next;
     }
-    
+
+    /* Destroy reassembly queue */
+    if (conn->reasm_queue) {
+        reasm_queue_destroy(conn->reasm_queue);
+    }
+
     /* Remove from connection list */
     if (conn == connection_list) {
         connection_list = conn->next;
@@ -589,7 +1376,7 @@ void tcp_destroy_connection(struct tcp_connection* conn) {
             prev->next = conn->next;
         }
     }
-    
+
     kfree(conn);
 }
 

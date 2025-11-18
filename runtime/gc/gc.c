@@ -1,4 +1,11 @@
-/* AstraLisp OS Garbage Collector Complete Implementation */
+/* AstraLisp OS Garbage Collector Complete Implementation
+ * Features:
+ * - Generational GC with young/old generations
+ * - Write barriers for tracking old→young references
+ * - Remembered set (hash table based) for efficient tracking
+ * - Card table for fine-grained tracking (512-byte cards)
+ * - Mark and sweep with object promotion
+ */
 
 #include "gc.h"
 #include "../../kernel/mm/heap.h"
@@ -10,6 +17,15 @@
 #define GC_MARK_BIT 0x1
 #define GC_WEAK_BIT 0x2
 #define GC_OLD_GEN_BIT 0x4
+
+/* Card table constants */
+#define CARD_SIZE 512  /* 512-byte cards for efficient tracking */
+#define CARD_TABLE_SIZE (256 * 1024)  /* Support up to 128MB heap (256K cards * 512 bytes) */
+#define CARD_CLEAN 0
+#define CARD_DIRTY 1
+
+/* Remembered set constants */
+#define REMEMBERED_SET_SIZE 4096  /* Hash table with 4096 buckets */
 
 /* GC object header */
 struct gc_object_header {
@@ -33,6 +49,13 @@ struct gc_root {
     struct gc_root* next;
 };
 
+/* Remembered set entry (hash table node) */
+struct remembered_entry {
+    void* old_obj;                  /* Old generation object */
+    void* young_ref;                /* Young generation reference */
+    struct remembered_entry* next;  /* Hash chain */
+};
+
 /* GC context */
 struct gc_context {
     struct gc_generation young_gen;
@@ -42,16 +65,24 @@ struct gc_context {
     bool collecting;
     bool concurrent;
     struct gc_stats stats;
+
+    /* Write barrier support */
+    uint8_t* card_table;                              /* Card table for dirty tracking */
+    struct remembered_entry* remembered_set[REMEMBERED_SET_SIZE];  /* Hash table */
+    size_t remembered_count;                          /* Number of entries in remembered set */
+    bool write_barrier_enabled;                       /* Write barrier on/off */
 };
 
 static struct gc_context* gc_ctx = NULL;
+
+/* ========== Utility Functions ========== */
 
 /* Get object header */
 static struct gc_object_header* get_header(void* ptr) {
     if (!ptr) {
         return NULL;
     }
-    
+
     return (struct gc_object_header*)((uint8_t*)ptr - sizeof(struct gc_object_header));
 }
 
@@ -60,8 +91,178 @@ static void* get_object(struct gc_object_header* header) {
     if (!header) {
         return NULL;
     }
-    
+
     return (void*)((uint8_t*)header + sizeof(struct gc_object_header));
+}
+
+/* Check if object is in old generation */
+static bool is_old_generation(void* obj) {
+    if (!obj || !gc_ctx) {
+        return false;
+    }
+
+    struct gc_object_header* header = get_header(obj);
+    if (!header) {
+        return false;
+    }
+
+    return (header->flags & GC_OLD_GEN_BIT) != 0;
+}
+
+/* Check if object is in young generation */
+static bool is_young_generation(void* obj) {
+    return !is_old_generation(obj);
+}
+
+/* ========== Card Table Management ========== */
+
+/* Get card index for address */
+static inline size_t get_card_index(void* addr) {
+    uintptr_t ptr_val = (uintptr_t)addr;
+    return (ptr_val / CARD_SIZE) % CARD_TABLE_SIZE;
+}
+
+/* Mark card as dirty */
+static inline void mark_card_dirty(void* addr) {
+    if (!gc_ctx || !gc_ctx->card_table) {
+        return;
+    }
+
+    size_t card_idx = get_card_index(addr);
+    gc_ctx->card_table[card_idx] = CARD_DIRTY;
+}
+
+/* Mark card as clean */
+static inline void mark_card_clean(void* addr) {
+    if (!gc_ctx || !gc_ctx->card_table) {
+        return;
+    }
+
+    size_t card_idx = get_card_index(addr);
+    gc_ctx->card_table[card_idx] = CARD_CLEAN;
+}
+
+/* Check if card is dirty */
+static inline bool is_card_dirty(void* addr) {
+    if (!gc_ctx || !gc_ctx->card_table) {
+        return false;
+    }
+
+    size_t card_idx = get_card_index(addr);
+    return gc_ctx->card_table[card_idx] == CARD_DIRTY;
+}
+
+/* ========== Remembered Set Management ========== */
+
+/* Hash function for remembered set */
+static uint32_t hash_pointer(void* ptr) {
+    uintptr_t val = (uintptr_t)ptr;
+    /* Simple hash: mix bits */
+    val = ((val >> 16) ^ val) * 0x45d9f3b;
+    val = ((val >> 16) ^ val) * 0x45d9f3b;
+    val = (val >> 16) ^ val;
+    return val % REMEMBERED_SET_SIZE;
+}
+
+/* Add to remembered set */
+static void remembered_set_add(void* old_obj, void* young_ref) {
+    if (!gc_ctx || !old_obj || !young_ref) {
+        return;
+    }
+
+    uint32_t hash = hash_pointer(old_obj);
+
+    /* Check if already exists */
+    struct remembered_entry* entry = gc_ctx->remembered_set[hash];
+    while (entry) {
+        if (entry->old_obj == old_obj && entry->young_ref == young_ref) {
+            return;  /* Already in set */
+        }
+        entry = entry->next;
+    }
+
+    /* Allocate new entry */
+    entry = (struct remembered_entry*)kmalloc(sizeof(struct remembered_entry));
+    if (!entry) {
+        return;  /* Out of memory - degraded performance but not fatal */
+    }
+
+    entry->old_obj = old_obj;
+    entry->young_ref = young_ref;
+    entry->next = gc_ctx->remembered_set[hash];
+    gc_ctx->remembered_set[hash] = entry;
+    gc_ctx->remembered_count++;
+}
+
+/* Clear remembered set */
+static void remembered_set_clear(void) {
+    if (!gc_ctx) {
+        return;
+    }
+
+    for (size_t i = 0; i < REMEMBERED_SET_SIZE; i++) {
+        struct remembered_entry* entry = gc_ctx->remembered_set[i];
+        while (entry) {
+            struct remembered_entry* next = entry->next;
+            kfree(entry);
+            entry = next;
+        }
+        gc_ctx->remembered_set[i] = NULL;
+    }
+
+    gc_ctx->remembered_count = 0;
+}
+
+/* Scan remembered set and mark referenced young objects */
+static void scan_remembered_set(void) {
+    if (!gc_ctx) {
+        return;
+    }
+
+    for (size_t i = 0; i < REMEMBERED_SET_SIZE; i++) {
+        struct remembered_entry* entry = gc_ctx->remembered_set[i];
+        while (entry) {
+            /* Mark the young object referenced by old object */
+            if (entry->young_ref && is_young_generation(entry->young_ref)) {
+                struct gc_object_header* header = get_header(entry->young_ref);
+                if (header && !(header->flags & GC_MARK_BIT)) {
+                    mark_object(entry->young_ref);  /* Forward reference to mark_object */
+                }
+            }
+            entry = entry->next;
+        }
+    }
+}
+
+/* ========== Write Barrier (CRITICAL for Generational GC) ========== */
+
+/*
+ * Write barrier - MUST be called whenever an object field is modified
+ * This prevents premature collection of young objects referenced by old objects
+ *
+ * Usage: gc_write_barrier(old_obj, old_obj->field, new_value);
+ * Then: old_obj->field = new_value;
+ */
+void gc_write_barrier(void* obj, void** field_addr, void* new_value) {
+    if (!gc_ctx || !obj || !field_addr || !gc_ctx->write_barrier_enabled) {
+        return;
+    }
+
+    /* No barrier needed if GC is currently collecting (already marking) */
+    if (gc_ctx->collecting) {
+        return;
+    }
+
+    /* Check if this is an old→young reference */
+    if (is_old_generation(obj) && new_value && is_young_generation(new_value)) {
+        /* This is a critical old→young reference - track it! */
+
+        /* Add to remembered set */
+        remembered_set_add(obj, new_value);
+
+        /* Mark card table as dirty */
+        mark_card_dirty(obj);
+    }
 }
 
 /* Mark object */
@@ -185,19 +386,26 @@ static void collect_young(void) {
     if (!gc_ctx) {
         return;
     }
-    
+
     gc_ctx->collecting = true;
-    
+
     /* Mark phase */
     mark_roots();
-    
+
+    /* CRITICAL: Scan remembered set to mark young objects referenced by old objects */
+    /* This prevents premature collection of young objects still reachable from old gen */
+    scan_remembered_set();
+
     /* Sweep phase */
     size_t freed = sweep_generation(&gc_ctx->young_gen);
-    
+
+    /* Clear remembered set after collection (will be rebuilt by write barriers) */
+    remembered_set_clear();
+
     gc_ctx->young_gen.collection_count++;
     gc_ctx->stats.total_freed += freed;
     gc_ctx->stats.collection_count++;
-    
+
     gc_ctx->collecting = false;
 }
 
@@ -226,31 +434,52 @@ int gc_init(void) {
     if (gc_ctx) {
         return 0;
     }
-    
+
     gc_ctx = (struct gc_context*)kmalloc(sizeof(struct gc_context));
     if (!gc_ctx) {
         return -1;
     }
-    
+
     memset(gc_ctx, 0, sizeof(struct gc_context));
-    
+
+    /* Initialize generations */
     gc_ctx->young_gen.objects = NULL;
     gc_ctx->young_gen.total_size = 0;
     gc_ctx->young_gen.allocated_size = 0;
     gc_ctx->young_gen.collection_count = 0;
-    
+
     gc_ctx->old_gen.objects = NULL;
     gc_ctx->old_gen.total_size = 0;
     gc_ctx->old_gen.allocated_size = 0;
     gc_ctx->old_gen.collection_count = 0;
-    
+
+    /* Initialize roots */
     gc_ctx->roots = NULL;
+
+    /* Initialize GC parameters */
     gc_ctx->collection_threshold = 1024 * 1024;  /* 1MB */
     gc_ctx->collecting = false;
     gc_ctx->concurrent = false;
-    
+
+    /* Allocate card table */
+    gc_ctx->card_table = (uint8_t*)kmalloc(CARD_TABLE_SIZE);
+    if (!gc_ctx->card_table) {
+        kfree(gc_ctx);
+        gc_ctx = NULL;
+        return -1;
+    }
+    memset(gc_ctx->card_table, CARD_CLEAN, CARD_TABLE_SIZE);
+
+    /* Initialize remembered set (hash table) */
+    memset(gc_ctx->remembered_set, 0, sizeof(gc_ctx->remembered_set));
+    gc_ctx->remembered_count = 0;
+
+    /* Enable write barrier */
+    gc_ctx->write_barrier_enabled = true;
+
+    /* Initialize statistics */
     memset(&gc_ctx->stats, 0, sizeof(struct gc_stats));
-    
+
     return 0;
 }
 

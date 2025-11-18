@@ -11,10 +11,10 @@ extern syscall_count
 ; r3 = syscall number, r4-r10 = arguments
 global syscall_entry
 syscall_entry:
-    ; Check if in kernel mode (MSR[PR] = 0)
+    ; Check if in user mode (MSR[PR] = 1) - syscalls only allowed from user space
     mfmsr %r11
-    andi. %r11, %r11, 0x2000          ; Check PR bit
-    bne syscall_invalid               ; If user mode, invalid
+    andi. %r11, %r11, 0x2000          ; Check PR bit (0x2000 = bit 14, problem state)
+    beq syscall_invalid               ; If kernel mode (PR=0), invalid - syscalls are for user→kernel transition
     
     ; Validate syscall number
     cmpdi %r3, 0

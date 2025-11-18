@@ -30,6 +30,54 @@ typedef enum {
 #define TCP_FLAG_ACK 0x10
 #define TCP_FLAG_URG 0x20
 
+/* TCP options */
+#define TCP_OPT_END         0
+#define TCP_OPT_NOP         1
+#define TCP_OPT_MSS         2
+#define TCP_OPT_WINDOW      3
+#define TCP_OPT_SACK_PERM   4
+#define TCP_OPT_SACK        5
+#define TCP_OPT_TIMESTAMP   8
+
+/* SACK block */
+struct tcp_sack_block {
+    uint32_t left_edge;   /* Left edge of block */
+    uint32_t right_edge;  /* Right edge of block */
+};
+
+/* Maximum SACK blocks per segment (RFC 2018) */
+#define TCP_MAX_SACK_BLOCKS 4
+
+/* Red-Black tree colors */
+typedef enum {
+    RB_RED = 0,
+    RB_BLACK = 1
+} rb_color_t;
+
+/* Out-of-order segment node (Red-Black tree) */
+struct ooo_segment {
+    uint32_t seq_start;           /* Start sequence number */
+    uint32_t seq_end;             /* End sequence number (exclusive) */
+    uint8_t* data;                /* Segment data */
+    size_t data_len;              /* Data length */
+    uint64_t timestamp;           /* Arrival timestamp */
+
+    /* Red-Black tree linkage */
+    struct ooo_segment* parent;
+    struct ooo_segment* left;
+    struct ooo_segment* right;
+    rb_color_t color;
+};
+
+/* Reassembly queue (Red-Black tree root) */
+struct reassembly_queue {
+    struct ooo_segment* root;     /* Tree root */
+    struct ooo_segment* nil;      /* Sentinel node */
+    uint32_t segment_count;       /* Number of segments */
+    size_t total_bytes;           /* Total buffered bytes */
+    size_t max_bytes;             /* Maximum buffer size */
+};
+
 /* TCP header */
 struct tcp_header {
     uint16_t src_port;
@@ -96,7 +144,15 @@ struct tcp_connection {
     struct tcp_segment* recv_queue;
     size_t recv_buffer_size;
     size_t recv_buffer_used;
-    
+
+    /* Out-of-order reassembly queue */
+    struct reassembly_queue* reasm_queue;
+
+    /* SACK support */
+    bool sack_permitted;              /* SACK enabled for this connection */
+    struct tcp_sack_block sack_blocks[TCP_MAX_SACK_BLOCKS];
+    uint32_t sack_block_count;        /* Number of SACK blocks */
+
     /* Timers */
     uint64_t retransmit_timer;
     uint64_t persist_timer;
@@ -150,5 +206,21 @@ int tcp_retransmit(struct tcp_connection* conn);
 /* Find connection */
 struct tcp_connection* tcp_find_connection(uint32_t local_addr, uint16_t local_port,
                                           uint32_t remote_addr, uint16_t remote_port);
+
+/* Reassembly queue operations */
+struct reassembly_queue* reasm_queue_create(size_t max_bytes);
+void reasm_queue_destroy(struct reassembly_queue* queue);
+int reasm_queue_insert(struct reassembly_queue* queue, uint32_t seq_start,
+                       uint32_t seq_end, const uint8_t* data, size_t data_len);
+struct ooo_segment* reasm_queue_extract_ready(struct reassembly_queue* queue,
+                                              uint32_t recv_next);
+void reasm_queue_remove_below(struct reassembly_queue* queue, uint32_t seq);
+
+/* SACK operations */
+void tcp_generate_sack_blocks(struct tcp_connection* conn);
+int tcp_add_sack_option(struct tcp_header* header, const struct tcp_sack_block* blocks,
+                        uint32_t block_count);
+int tcp_parse_sack_option(const uint8_t* options, size_t options_len,
+                          struct tcp_sack_block* blocks, uint32_t* block_count);
 
 #endif /* TCP_H */

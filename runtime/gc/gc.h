@@ -25,6 +25,18 @@ void gc_mark(void* obj);
 /* Run garbage collection */
 void gc_collect(void);
 
+/*
+ * Write barrier - MUST be called when modifying object references
+ * This is CRITICAL for generational GC correctness!
+ *
+ * Usage:
+ *   gc_write_barrier(obj, &obj->field, new_value);
+ *   obj->field = new_value;  // Then perform the actual write
+ *
+ * Prevents premature collection of young objects referenced by old objects
+ */
+void gc_write_barrier(void* obj, void** field_addr, void* new_value);
+
 /* Add root pointer */
 int gc_add_root(void** pointer);
 

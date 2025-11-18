@@ -16,6 +16,9 @@ void* pmm_alloc(void);
 /* Free a page frame */
 void pmm_free(void* frame);
 
+/* Allocate multiple contiguous page frames */
+void* pmm_alloc_multiple(size_t pages);
+
 /* Get number of free pages */
 size_t pmm_get_free_count(void);
 

@@ -6,6 +6,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Page flags (PowerISA-specific) */
+#define PAGE_PRESENT        0x00000001
+#define PAGE_WRITABLE       0x00000002
+#define PAGE_USER           0x00000004
+#define PAGE_LARGE          0x00000008  /* 64KB page instead of 4KB */
+#define PAGE_CACHE_DISABLE  0x00000010
+#define PAGE_NO_EXECUTE     0x00000020
+
+/* SLB (Segment Lookaside Buffer) flags */
+#define SLB_KERNEL          0x00000001  /* Kernel segment */
+#define SLB_USER            0x00000002  /* User segment */
+#define SLB_EXECUTE         0x00000004  /* Execute permission */
+
 /* Initialize virtual memory manager */
 int vmm_init(void);
 

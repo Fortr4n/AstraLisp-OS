@@ -7,9 +7,9 @@ align 8
 multiboot_header_start:
     ; Magic number
     dd 0xE85250D6                    ; Multiboot 2 magic
-    dd 0                              ; Architecture: 0 = i386, 4 = MIPS32, 8 = PowerPC
+    dd 8                              ; Architecture: 8 = PowerPC/PowerISA (was 0=i386, FIXED)
     dd multiboot_header_end - multiboot_header_start  ; Header length
-    dd -(0xE85250D6 + 0 + (multiboot_header_end - multiboot_header_start))  ; Checksum
+    dd -(0xE85250D6 + 8 + (multiboot_header_end - multiboot_header_start))  ; Checksum (updated for arch=8)
 
     ; Information request tag
     align 8
