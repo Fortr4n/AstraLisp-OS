@@ -9,6 +9,263 @@
 
 static struct lisp_environment* global_env = NULL;
 
+/*
+ * ============================================================================
+ * HASH TABLE IMPLEMENTATION FOR ENVIRONMENT BINDINGS
+ * ============================================================================
+ */
+
+#define ENV_HASH_INITIAL_CAPACITY 16
+#define ENV_HASH_LOAD_FACTOR 0.75f
+#define ENV_HASH_MAX_CHAIN_LENGTH 8
+
+/* FNV-1a hash function for strings (32-bit) */
+static uint32_t hash_string_fnv1a(const char* str) {
+    if (!str) {
+        return 0;
+    }
+
+    uint32_t hash = 2166136261u;  /* FNV offset basis */
+    const uint8_t* bytes = (const uint8_t*)str;
+
+    while (*bytes) {
+        hash ^= *bytes++;
+        hash *= 16777619u;  /* FNV prime */
+    }
+
+    return hash;
+}
+
+/* Hash symbol for hash table */
+static uint32_t hash_symbol(struct lisp_object* symbol) {
+    if (!symbol || symbol->type != LISP_SYMBOL || !symbol->value.symbol.name) {
+        return 0;
+    }
+
+    return hash_string_fnv1a(symbol->value.symbol.name);
+}
+
+/* Create hash table */
+struct env_hash_table* env_hash_create(uint32_t initial_capacity) {
+    if (initial_capacity < 4) {
+        initial_capacity = ENV_HASH_INITIAL_CAPACITY;
+    }
+
+    /* Round up to next power of 2 for efficient modulo */
+    uint32_t capacity = 4;
+    while (capacity < initial_capacity) {
+        capacity *= 2;
+    }
+
+    struct env_hash_table* table = (struct env_hash_table*)kmalloc(sizeof(struct env_hash_table));
+    if (!table) {
+        return NULL;
+    }
+
+    table->buckets = (struct env_hash_entry**)kmalloc(capacity * sizeof(struct env_hash_entry*));
+    if (!table->buckets) {
+        kfree(table);
+        return NULL;
+    }
+
+    /* Initialize all buckets to NULL */
+    for (uint32_t i = 0; i < capacity; i++) {
+        table->buckets[i] = NULL;
+    }
+
+    table->bucket_count = capacity;
+    table->entry_count = 0;
+    table->load_factor = ENV_HASH_LOAD_FACTOR;
+
+    return table;
+}
+
+/* Destroy hash table */
+void env_hash_destroy(struct env_hash_table* table) {
+    if (!table) {
+        return;
+    }
+
+    /* Free all entries */
+    for (uint32_t i = 0; i < table->bucket_count; i++) {
+        struct env_hash_entry* entry = table->buckets[i];
+        while (entry) {
+            struct env_hash_entry* next = entry->next;
+
+            /* Decrement reference counts */
+            if (entry->key) {
+                lisp_decref(entry->key);
+            }
+            if (entry->value) {
+                lisp_decref(entry->value);
+            }
+
+            kfree(entry);
+            entry = next;
+        }
+    }
+
+    kfree(table->buckets);
+    kfree(table);
+}
+
+/* Get value from hash table */
+struct lisp_object* env_hash_get(struct env_hash_table* table, struct lisp_object* key) {
+    if (!table || !key || key->type != LISP_SYMBOL) {
+        return NULL;
+    }
+
+    uint32_t hash = hash_symbol(key);
+    uint32_t index = hash & (table->bucket_count - 1);  /* Efficient modulo for power of 2 */
+
+    struct env_hash_entry* entry = table->buckets[index];
+    while (entry) {
+        /* Check hash first (fast path) */
+        if (entry->hash == hash) {
+            /* Verify key equality */
+            if (entry->key && entry->key->type == LISP_SYMBOL &&
+                key->value.symbol.name && entry->key->value.symbol.name &&
+                strcmp(key->value.symbol.name, entry->key->value.symbol.name) == 0) {
+                return entry->value;
+            }
+        }
+        entry = entry->next;
+    }
+
+    return NULL;
+}
+
+/* Resize hash table */
+void env_hash_resize(struct env_hash_table* table, uint32_t new_capacity) {
+    if (!table || new_capacity < 4) {
+        return;
+    }
+
+    /* Round up to next power of 2 */
+    uint32_t capacity = 4;
+    while (capacity < new_capacity) {
+        capacity *= 2;
+    }
+
+    /* Allocate new bucket array */
+    struct env_hash_entry** new_buckets = (struct env_hash_entry**)kmalloc(
+        capacity * sizeof(struct env_hash_entry*));
+    if (!new_buckets) {
+        return;  /* Resize failed - continue with old table */
+    }
+
+    /* Initialize new buckets */
+    for (uint32_t i = 0; i < capacity; i++) {
+        new_buckets[i] = NULL;
+    }
+
+    /* Rehash all entries */
+    for (uint32_t i = 0; i < table->bucket_count; i++) {
+        struct env_hash_entry* entry = table->buckets[i];
+        while (entry) {
+            struct env_hash_entry* next = entry->next;
+
+            /* Rehash to new bucket */
+            uint32_t new_index = entry->hash & (capacity - 1);
+            entry->next = new_buckets[new_index];
+            new_buckets[new_index] = entry;
+
+            entry = next;
+        }
+    }
+
+    /* Replace old buckets with new */
+    kfree(table->buckets);
+    table->buckets = new_buckets;
+    table->bucket_count = capacity;
+}
+
+/* Put value into hash table (insert new entry) */
+int env_hash_put(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value) {
+    if (!table || !key || key->type != LISP_SYMBOL || !value) {
+        return -1;
+    }
+
+    /* Check if resize needed */
+    float current_load = (float)table->entry_count / (float)table->bucket_count;
+    if (current_load > table->load_factor) {
+        env_hash_resize(table, table->bucket_count * 2);
+    }
+
+    uint32_t hash = hash_symbol(key);
+    uint32_t index = hash & (table->bucket_count - 1);
+
+    /* Check for duplicate key */
+    struct env_hash_entry* existing = table->buckets[index];
+    while (existing) {
+        if (existing->hash == hash) {
+            if (existing->key && existing->key->type == LISP_SYMBOL &&
+                key->value.symbol.name && existing->key->value.symbol.name &&
+                strcmp(key->value.symbol.name, existing->key->value.symbol.name) == 0) {
+                /* Key already exists - update value */
+                if (existing->value) {
+                    lisp_decref(existing->value);
+                }
+                existing->value = value;
+                lisp_incref(value);
+                return 0;
+            }
+        }
+        existing = existing->next;
+    }
+
+    /* Create new entry */
+    struct env_hash_entry* entry = (struct env_hash_entry*)kmalloc(sizeof(struct env_hash_entry));
+    if (!entry) {
+        return -1;
+    }
+
+    entry->key = key;
+    entry->value = value;
+    entry->hash = hash;
+    entry->next = table->buckets[index];
+
+    /* Increment reference counts */
+    lisp_incref(key);
+    lisp_incref(value);
+
+    /* Insert at head of chain */
+    table->buckets[index] = entry;
+    table->entry_count++;
+
+    return 0;
+}
+
+/* Update existing value in hash table */
+int env_hash_update(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value) {
+    if (!table || !key || key->type != LISP_SYMBOL || !value) {
+        return -1;
+    }
+
+    uint32_t hash = hash_symbol(key);
+    uint32_t index = hash & (table->bucket_count - 1);
+
+    struct env_hash_entry* entry = table->buckets[index];
+    while (entry) {
+        if (entry->hash == hash) {
+            if (entry->key && entry->key->type == LISP_SYMBOL &&
+                key->value.symbol.name && entry->key->value.symbol.name &&
+                strcmp(key->value.symbol.name, entry->key->value.symbol.name) == 0) {
+                /* Found - update value */
+                if (entry->value) {
+                    lisp_decref(entry->value);
+                }
+                entry->value = value;
+                lisp_incref(value);
+                return 0;
+            }
+        }
+        entry = entry->next;
+    }
+
+    return -1;  /* Key not found */
+}
+
 /* Built-in function table */
 struct builtin_entry {
     char* name;
@@ -24,11 +281,31 @@ struct lisp_environment* env_create(struct lisp_environment* parent) {
     if (!env) {
         return NULL;
     }
-    
-    env->bindings = lisp_nil();
+
+    env->bindings = env_hash_create(ENV_HASH_INITIAL_CAPACITY);
+    if (!env->bindings) {
+        kfree(env);
+        return NULL;
+    }
+
     env->parent = parent;
-    
+
     return env;
+}
+
+/* Destroy environment */
+void env_destroy(struct lisp_environment* env) {
+    if (!env) {
+        return;
+    }
+
+    /* Destroy hash table (this decrements all referenced objects) */
+    if (env->bindings) {
+        env_hash_destroy(env->bindings);
+    }
+
+    /* Note: We don't destroy parent - parent is managed separately */
+    kfree(env);
 }
 
 /* Lookup variable */
@@ -36,77 +313,59 @@ struct lisp_object* env_lookup(struct lisp_environment* env, struct lisp_object*
     if (!env || !symbol || symbol->type != LISP_SYMBOL) {
         return NULL;
     }
-    
+
+    /* Search current environment and all parents */
     struct lisp_environment* current = env;
     while (current) {
-        struct lisp_object* bindings = current->bindings;
-        while (bindings && bindings->type == LISP_CONS) {
-            struct lisp_object* binding = bindings->value.cons.car;
-            if (binding && binding->type == LISP_CONS) {
-                struct lisp_object* key = binding->value.cons.car;
-                struct lisp_object* value = binding->value.cons.cdr;
-                if (key && key->type == LISP_CONS) {
-                    struct lisp_object* key_sym = key->value.cons.car;
-                    if (lisp_equal(key_sym, symbol)) {
-                        if (value && value->type == LISP_CONS) {
-                            return value->value.cons.car;
-                        }
-                    }
-                }
+        if (current->bindings) {
+            struct lisp_object* value = env_hash_get(current->bindings, symbol);
+            if (value) {
+                return value;
             }
-            bindings = bindings->value.cons.cdr;
         }
         current = current->parent;
     }
-    
+
     return NULL;
 }
 
 /* Define variable */
 int env_define(struct lisp_environment* env, struct lisp_object* symbol, struct lisp_object* value) {
-    if (!env || !symbol || symbol->type != LISP_SYMBOL) {
+    if (!env || !symbol || symbol->type != LISP_SYMBOL || !value) {
         return -1;
     }
-    
-    struct lisp_object* key_pair = lisp_create_cons(symbol, lisp_nil());
-    struct lisp_object* binding = lisp_create_cons(key_pair, lisp_create_cons(value, lisp_nil()));
-    env->bindings = lisp_create_cons(binding, env->bindings);
-    
-    return 0;
+
+    if (!env->bindings) {
+        env->bindings = env_hash_create(ENV_HASH_INITIAL_CAPACITY);
+        if (!env->bindings) {
+            return -1;
+        }
+    }
+
+    return env_hash_put(env->bindings, symbol, value);
 }
 
 /* Set variable */
 int env_set(struct lisp_environment* env, struct lisp_object* symbol, struct lisp_object* value) {
-    if (!env || !symbol || symbol->type != LISP_SYMBOL) {
+    if (!env || !symbol || symbol->type != LISP_SYMBOL || !value) {
         return -1;
     }
-    
+
+    /* Search current environment and all parents for existing binding */
     struct lisp_environment* current = env;
     while (current) {
-        struct lisp_object* bindings = current->bindings;
-        while (bindings && bindings->type == LISP_CONS) {
-            struct lisp_object* binding = bindings->value.cons.car;
-            if (binding && binding->type == LISP_CONS) {
-                struct lisp_object* key = binding->value.cons.car;
-                if (key && key->type == LISP_CONS) {
-                    struct lisp_object* key_sym = key->value.cons.car;
-                    if (lisp_equal(key_sym, symbol)) {
-                        struct lisp_object* val_cell = binding->value.cons.cdr;
-                        if (val_cell && val_cell->type == LISP_CONS) {
-                            lisp_decref(val_cell->value.cons.car);
-                            val_cell->value.cons.car = value;
-                            lisp_incref(value);
-                            return 0;
-                        }
-                    }
-                }
+        if (current->bindings) {
+            /* Check if symbol exists in this environment */
+            struct lisp_object* existing = env_hash_get(current->bindings, symbol);
+            if (existing) {
+                /* Update existing binding */
+                return env_hash_update(current->bindings, symbol, value);
             }
-            bindings = bindings->value.cons.cdr;
         }
         current = current->parent;
     }
-    
-    return -1;
+
+    return -1;  /* Symbol not found in any environment */
 }
 
 /* Evaluate expression */

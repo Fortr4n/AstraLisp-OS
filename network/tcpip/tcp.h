@@ -223,4 +223,14 @@ int tcp_add_sack_option(struct tcp_header* header, const struct tcp_sack_block* 
 int tcp_parse_sack_option(const uint8_t* options, size_t options_len,
                           struct tcp_sack_block* blocks, uint32_t* block_count);
 
+/* SYN cookie operations */
+uint32_t tcp_generate_syn_cookie(uint32_t src_addr, uint32_t dst_addr,
+                                  uint16_t src_port, uint16_t dst_port,
+                                  uint32_t seq_num, uint8_t mss_code);
+bool tcp_validate_syn_cookie(uint32_t src_addr, uint32_t dst_addr,
+                              uint16_t src_port, uint16_t dst_port,
+                              uint32_t seq_num, uint32_t cookie, uint8_t* mss_code);
+uint8_t tcp_encode_mss(uint16_t mss);
+uint16_t tcp_decode_mss(uint8_t mss_code);
+
 #endif /* TCP_H */

@@ -6,14 +6,41 @@
 #include "reader.h"
 #include <stdbool.h>
 
+/* Hash table entry for symbol bindings */
+struct env_hash_entry {
+    struct lisp_object* key;      /* Symbol */
+    struct lisp_object* value;    /* Bound value */
+    uint32_t hash;                /* Cached hash value */
+    struct env_hash_entry* next;  /* Collision chain */
+};
+
+/* Hash table for environment bindings */
+struct env_hash_table {
+    struct env_hash_entry** buckets;  /* Array of bucket chains */
+    uint32_t bucket_count;            /* Number of buckets */
+    uint32_t entry_count;             /* Number of entries */
+    float load_factor;                /* Load factor threshold for resize */
+};
+
 /* Environment (binding frame) */
 struct lisp_environment {
-    struct lisp_object* bindings;  /* Association list */
-    struct lisp_environment* parent;
+    struct env_hash_table* bindings;  /* Hash table of bindings */
+    struct lisp_environment* parent;  /* Parent environment */
 };
+
+/* Hash table operations */
+struct env_hash_table* env_hash_create(uint32_t initial_capacity);
+void env_hash_destroy(struct env_hash_table* table);
+struct lisp_object* env_hash_get(struct env_hash_table* table, struct lisp_object* key);
+int env_hash_put(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value);
+int env_hash_update(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value);
+void env_hash_resize(struct env_hash_table* table, uint32_t new_capacity);
 
 /* Create environment */
 struct lisp_environment* env_create(struct lisp_environment* parent);
+
+/* Destroy environment */
+void env_destroy(struct lisp_environment* env);
 
 /* Lookup variable */
 struct lisp_object* env_lookup(struct lisp_environment* env, struct lisp_object* symbol);

@@ -659,6 +659,237 @@ int tcp_parse_sack_option(const uint8_t* options, size_t options_len,
     return -1;  /* SACK option not found */
 }
 
+/*
+ * ============================================================================
+ * SYN COOKIES IMPLEMENTATION - RFC 4987
+ * ============================================================================
+ */
+
+#define SYN_COOKIE_SECRET_SIZE 32
+#define SYN_COOKIE_TIMESTAMP_BITS 5
+#define SYN_COOKIE_MSS_BITS 3
+
+/* Secret keys for SYN cookie generation (should be rotated periodically) */
+static uint32_t syn_cookie_secret[SYN_COOKIE_SECRET_SIZE / 4] = {
+    0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0xBAADF00D,
+    0xC0FFEE00, 0xDEADC0DE, 0xFACEFEED, 0xBEEFFACE
+};
+
+/* Current time counter for SYN cookies (incremented every 64 seconds) */
+static uint32_t syn_cookie_time = 0;
+
+/* MSS encoding table (limited values for 3-bit encoding) */
+static const uint16_t mss_table[] = {
+    536,   /* Code 0: Minimum MSS */
+    1200,  /* Code 1 */
+    1300,  /* Code 2 */
+    1400,  /* Code 3 */
+    1440,  /* Code 4: Ethernet - headers */
+    1460,  /* Code 5: Default MSS */
+    4312,  /* Code 6: Jumbo frames */
+    8960   /* Code 7: Large MTU */
+};
+
+/* Encode MSS value to 3-bit code */
+uint8_t tcp_encode_mss(uint16_t mss) {
+    /* Find closest MSS value in table */
+    uint8_t best_code = 0;
+    uint16_t best_diff = 0xFFFF;
+
+    for (uint8_t i = 0; i < 8; i++) {
+        uint16_t diff = (mss > mss_table[i]) ? (mss - mss_table[i]) : (mss_table[i] - mss);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_code = i;
+        }
+    }
+
+    return best_code;
+}
+
+/* Decode 3-bit MSS code to value */
+uint16_t tcp_decode_mss(uint8_t mss_code) {
+    if (mss_code >= 8) {
+        return mss_table[5];  /* Default MSS */
+    }
+    return mss_table[mss_code];
+}
+
+/* SipHash-2-4 for cookie generation (simplified version) */
+static uint64_t siphash24(const uint8_t* data, size_t len, const uint8_t* key) {
+    uint64_t v0 = 0x736f6d6570736575ULL;
+    uint64_t v1 = 0x646f72616e646f6dULL;
+    uint64_t v2 = 0x6c7967656e657261ULL;
+    uint64_t v3 = 0x7465646279746573ULL;
+
+    /* Initialize with key */
+    uint64_t k0 = ((uint64_t)key[0]) | ((uint64_t)key[1] << 8) |
+                  ((uint64_t)key[2] << 16) | ((uint64_t)key[3] << 24) |
+                  ((uint64_t)key[4] << 32) | ((uint64_t)key[5] << 40) |
+                  ((uint64_t)key[6] << 48) | ((uint64_t)key[7] << 56);
+
+    uint64_t k1 = ((uint64_t)key[8]) | ((uint64_t)key[9] << 8) |
+                  ((uint64_t)key[10] << 16) | ((uint64_t)key[11] << 24) |
+                  ((uint64_t)key[12] << 32) | ((uint64_t)key[13] << 40) |
+                  ((uint64_t)key[14] << 48) | ((uint64_t)key[15] << 56);
+
+    v3 ^= k1;
+    v2 ^= k0;
+    v1 ^= k1;
+    v0 ^= k0;
+
+    /* Process message */
+    const uint8_t* end = data + len - (len % 8);
+    const uint8_t* ptr = data;
+
+    while (ptr < end) {
+        uint64_t m = ((uint64_t)ptr[0]) | ((uint64_t)ptr[1] << 8) |
+                     ((uint64_t)ptr[2] << 16) | ((uint64_t)ptr[3] << 24) |
+                     ((uint64_t)ptr[4] << 32) | ((uint64_t)ptr[5] << 40) |
+                     ((uint64_t)ptr[6] << 48) | ((uint64_t)ptr[7] << 56);
+
+        v3 ^= m;
+
+        /* SipRound (simplified) */
+        for (int i = 0; i < 2; i++) {
+            v0 += v1; v1 = (v1 << 13) | (v1 >> 51); v1 ^= v0; v0 = (v0 << 32) | (v0 >> 32);
+            v2 += v3; v3 = (v3 << 16) | (v3 >> 48); v3 ^= v2;
+            v0 += v3; v3 = (v3 << 21) | (v3 >> 43); v3 ^= v0;
+            v2 += v1; v1 = (v1 << 17) | (v1 >> 47); v1 ^= v2; v2 = (v2 << 32) | (v2 >> 32);
+        }
+
+        v0 ^= m;
+        ptr += 8;
+    }
+
+    /* Finalization */
+    v2 ^= 0xff;
+    for (int i = 0; i < 4; i++) {
+        v0 += v1; v1 = (v1 << 13) | (v1 >> 51); v1 ^= v0; v0 = (v0 << 32) | (v0 >> 32);
+        v2 += v3; v3 = (v3 << 16) | (v3 >> 48); v3 ^= v2;
+        v0 += v3; v3 = (v3 << 21) | (v3 >> 43); v3 ^= v0;
+        v2 += v1; v1 = (v1 << 17) | (v1 >> 47); v1 ^= v2; v2 = (v2 << 32) | (v2 >> 32);
+    }
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+/* Generate SYN cookie for connection */
+uint32_t tcp_generate_syn_cookie(uint32_t src_addr, uint32_t dst_addr,
+                                  uint16_t src_port, uint16_t dst_port,
+                                  uint32_t seq_num, uint8_t mss_code) {
+    /* Encode connection tuple */
+    uint8_t data[20];
+    data[0] = (src_addr >> 24) & 0xFF;
+    data[1] = (src_addr >> 16) & 0xFF;
+    data[2] = (src_addr >> 8) & 0xFF;
+    data[3] = src_addr & 0xFF;
+    data[4] = (dst_addr >> 24) & 0xFF;
+    data[5] = (dst_addr >> 16) & 0xFF;
+    data[6] = (dst_addr >> 8) & 0xFF;
+    data[7] = dst_addr & 0xFF;
+    data[8] = (src_port >> 8) & 0xFF;
+    data[9] = src_port & 0xFF;
+    data[10] = (dst_port >> 8) & 0xFF;
+    data[11] = dst_port & 0xFF;
+    data[12] = (syn_cookie_time >> 24) & 0xFF;
+    data[13] = (syn_cookie_time >> 16) & 0xFF;
+    data[14] = (syn_cookie_time >> 8) & 0xFF;
+    data[15] = syn_cookie_time & 0xFF;
+    data[16] = mss_code & 0x07;
+    data[17] = (seq_num >> 16) & 0xFF;
+    data[18] = (seq_num >> 8) & 0xFF;
+    data[19] = seq_num & 0xFF;
+
+    /* Generate hash using SipHash */
+    uint64_t hash = siphash24(data, sizeof(data), (uint8_t*)syn_cookie_secret);
+
+    /* Construct cookie:
+     * Bits 31-27: Timestamp (5 bits, wraps every ~2048 seconds at 64s granularity)
+     * Bits 26-24: MSS code (3 bits)
+     * Bits 23-0:  Hash (24 bits)
+     */
+    uint32_t cookie = 0;
+    cookie |= ((syn_cookie_time & 0x1F) << 27);           /* 5-bit timestamp */
+    cookie |= ((mss_code & 0x07) << 24);                  /* 3-bit MSS code */
+    cookie |= ((uint32_t)(hash & 0xFFFFFF));              /* 24-bit hash */
+
+    return cookie;
+}
+
+/* Validate SYN cookie */
+bool tcp_validate_syn_cookie(uint32_t src_addr, uint32_t dst_addr,
+                              uint16_t src_port, uint16_t dst_port,
+                              uint32_t seq_num, uint32_t cookie, uint8_t* mss_code) {
+    if (!mss_code) {
+        return false;
+    }
+
+    /* Extract fields from cookie */
+    uint32_t cookie_time = (cookie >> 27) & 0x1F;
+    uint8_t cookie_mss = (cookie >> 24) & 0x07;
+    uint32_t cookie_hash = cookie & 0xFFFFFF;
+
+    /* Check timestamp (allow ±4 time units = ±256 seconds tolerance) */
+    uint32_t current_time = syn_cookie_time & 0x1F;
+    uint32_t time_diff = (current_time >= cookie_time) ?
+                         (current_time - cookie_time) :
+                         (32 + current_time - cookie_time);
+
+    if (time_diff > 4) {
+        return false;  /* Cookie too old or from future */
+    }
+
+    /* Reconstruct hash with extracted timestamp */
+    uint8_t data[20];
+    data[0] = (src_addr >> 24) & 0xFF;
+    data[1] = (src_addr >> 16) & 0xFF;
+    data[2] = (src_addr >> 8) & 0xFF;
+    data[3] = src_addr & 0xFF;
+    data[4] = (dst_addr >> 24) & 0xFF;
+    data[5] = (dst_addr >> 16) & 0xFF;
+    data[6] = (dst_addr >> 8) & 0xFF;
+    data[7] = dst_addr & 0xFF;
+    data[8] = (src_port >> 8) & 0xFF;
+    data[9] = src_port & 0xFF;
+    data[10] = (dst_port >> 8) & 0xFF;
+    data[11] = dst_port & 0xFF;
+
+    /* Try with current time and recent past times */
+    for (int t = 0; t <= 4; t++) {
+        uint32_t test_time = (syn_cookie_time - t) & 0x1F;
+        if (test_time != cookie_time) {
+            continue;
+        }
+
+        data[12] = (test_time >> 24) & 0xFF;
+        data[13] = (test_time >> 16) & 0xFF;
+        data[14] = (test_time >> 8) & 0xFF;
+        data[15] = test_time & 0xFF;
+        data[16] = cookie_mss & 0x07;
+        data[17] = (seq_num >> 16) & 0xFF;
+        data[18] = (seq_num >> 8) & 0xFF;
+        data[19] = seq_num & 0xFF;
+
+        /* Generate hash */
+        uint64_t hash = siphash24(data, sizeof(data), (uint8_t*)syn_cookie_secret);
+        uint32_t expected_hash = (uint32_t)(hash & 0xFFFFFF);
+
+        if (expected_hash == cookie_hash) {
+            /* Valid cookie */
+            *mss_code = cookie_mss;
+            return true;
+        }
+    }
+
+    return false;  /* Invalid cookie */
+}
+
+/* Increment SYN cookie time counter (called every 64 seconds) */
+void tcp_syn_cookie_tick(void) {
+    syn_cookie_time++;
+}
+
 /* Calculate TCP checksum */
 uint16_t tcp_calculate_checksum(const struct tcp_header* header, const uint8_t* data,
                                 size_t data_len, uint32_t src_addr, uint32_t dst_addr) {

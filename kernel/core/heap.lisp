@@ -10,6 +10,9 @@
 
 (in-package :astralisp-heap)
 
+;; Constants
+(defconstant +page-size+ 4096)
+
 ;; Heap allocator types
 (defconstant +allocator-slab+ 0)
 (defconstant +allocator-buddy+ 1)
@@ -228,14 +231,20 @@
       (pool-alloc-new-chunk pool)))
 
 (defun pool-alloc-new-chunk (pool)
-  "Allocate new chunk for pool."
-  (let ((chunk (heap-alloc (pool-chunk-size pool))))
-    (when chunk
-      (push chunk (pool-chunks pool))
-      (loop for i from 0 below (floor (pool-chunk-size pool) (pool-chunk-size pool))
-            for addr = (+ chunk (* i (pool-chunk-size pool)))
-            do (push addr (pool-free-chunks pool)))
-      (pop (pool-free-chunks pool)))))
+  "Allocate new chunk for pool (allocates a page and divides it into pool-sized chunks)."
+  ;; Allocate a full page to hold multiple objects
+  (let ((page (page-alloc)))
+    (when page
+      (let ((page-addr (page-frame-address page))
+            (chunk-size (pool-chunk-size pool))
+            (objects-per-page (floor +page-size+ (pool-chunk-size pool))))
+        (push page (pool-chunks pool))
+        ;; Divide page into pool-sized objects and add to free list
+        (loop for i from 0 below objects-per-page
+              for addr = (+ page-addr (* i chunk-size))
+              do (push addr (pool-free-chunks pool)))
+        ;; Return first object
+        (pop (pool-free-chunks pool))))))
 
 (defun pool-free (pool ptr)
   "Free from pool."
@@ -257,7 +266,18 @@
           do (setf aligned (* aligned 2)))
     aligned))
 
+;; Page frame structure reference
+(defstruct page-frame
+  "Physical page frame."
+  (address 0 :type (unsigned-byte 64)))
+
 ;; Forward declarations
-(defun page-alloc () nil)
-(defun memory-copy (src dst size) nil)
+(defun page-alloc ()
+  "Allocate a physical page frame."
+  (make-page-frame :address 0))  ; Stub
+
+(defun memory-copy (src dst size)
+  "Copy memory from src to dst."
+  (declare (ignore src dst size))
+  nil)
 
