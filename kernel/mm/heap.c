@@ -31,6 +31,12 @@ struct block_header {
 
 static uint8_t* heap_start = NULL;
 static size_t heap_used = 0;
+static bool buddy_initialized = false;
+
+/* Forward declarations */
+void* buddy_alloc(size_t size);
+void buddy_free(void* ptr, size_t size);
+int buddy_init(void* start, size_t size, uint32_t min_order, uint32_t max_order);
 
 /* Calculate checksum for block header (simple XOR checksum) */
 static inline uint32_t heap_calc_checksum(struct block_header* block) {
@@ -75,174 +81,68 @@ static inline bool would_overflow_add(size_t a, size_t b) {
 
 /* Initialize kernel heap */
 int heap_init(void) {
-    /* Allocate heap from PMM */
-    heap_start = (uint8_t*)pmm_alloc();
-    if (!heap_start) {
+    /* Get a large chunk of memory from PMM for the heap */
+    /* For Phase 1, we'll ask for 16MB */
+    size_t heap_size = 16 * 1024 * 1024;
+    void* heap_mem_phys = pmm_alloc_multiple(heap_size / 4096);
+    
+    if (!heap_mem_phys) {
         return -1;
     }
-
-    /* Initialize first block */
-    struct block_header* first = (struct block_header*)heap_start;
-    first->size = HEAP_SIZE - sizeof(struct block_header);
-    first->free = 1;
-    first->next = NULL;
-    first->prev = NULL;
-    heap_update_block(first);  /* Set magic and checksum */
-
-    heap_used = sizeof(struct block_header);
-
+    
+    /* Convert to virtual address for access */
+    void* heap_mem_virt = P2V((uintptr_t)heap_mem_phys);
+    
+    /* Initialize Buddy Allocator with this memory */
+    /* Min order 4 (16 bytes), Max order 24 (16MB) */
+    if (buddy_init(heap_mem_virt, heap_size, 4, 24) != 0) {
+        return -1;
+    }
+    
     return 0;
 }
 
-/* Allocate memory with comprehensive overflow and corruption protection */
+struct alloc_header {
+    size_t size;
+    uint32_t magic;
+};
+#define ALLOC_MAGIC 0xB00B1E5
+
+/* Allocate memory using appropriate allocator */
 void* kmalloc(size_t size) {
-    /* Validate input size */
-    if (size == 0) {
-        return NULL;
-    }
+    if (size == 0) return NULL;
 
-    /* Check for maximum allocation size (prevents overflow attacks) */
-    if (size > MAX_ALLOC_SIZE) {
-        return NULL;  /* Allocation too large */
-    }
+    if (!buddy_initialized) return NULL;
 
-    /* Check for integer overflow when adding header size */
-    if (would_overflow_add(size, sizeof(struct block_header))) {
-        return NULL;  /* Integer overflow detected */
-    }
-
-    size_t total_size = size + sizeof(struct block_header);
-
-    /* Check for overflow when aligning */
-    if (would_overflow_add(total_size, 7)) {
-        return NULL;  /* Integer overflow in alignment */
-    }
-
-    /* Align to 8 bytes */
-    total_size = (total_size + 7) & ~7UL;
-
-    /* Ensure total size doesn't exceed heap size */
-    if (total_size > HEAP_SIZE) {
-        return NULL;  /* Allocation exceeds heap size */
-    }
-
-    /* Find free block using first-fit strategy */
-    struct block_header* current = (struct block_header*)heap_start;
-
-    while (current) {
-        /* Validate block integrity before using */
-        if (!heap_validate_block(current)) {
-            /* Heap corruption detected! */
-            return NULL;
-        }
-
-        if (current->free && current->size >= total_size) {
-            /* Found suitable block */
-
-            /* Check if we should split this block */
-            size_t split_threshold = total_size + sizeof(struct block_header) + MIN_BLOCK_SIZE;
-
-            /* Check for overflow in split calculation */
-            if (!would_overflow_add(total_size, sizeof(struct block_header)) &&
-                !would_overflow_add(total_size + sizeof(struct block_header), MIN_BLOCK_SIZE)) {
-
-                if (current->size >= split_threshold) {
-                    /* Split block - create new free block after allocated one */
-                    struct block_header* new_block = (struct block_header*)((uint8_t*)current + total_size);
-
-                    /* Validate new block address is within heap */
-                    uintptr_t new_block_addr = (uintptr_t)new_block;
-                    uintptr_t heap_end = (uintptr_t)heap_start + HEAP_SIZE;
-
-                    if (new_block_addr + sizeof(struct block_header) <= heap_end) {
-                        new_block->size = current->size - total_size;
-                        new_block->free = 1;
-                        new_block->next = current->next;
-                        new_block->prev = current;
-                        heap_update_block(new_block);
-
-                        if (current->next) {
-                            current->next->prev = new_block;
-                        }
-
-                        current->size = total_size;
-                        current->next = new_block;
-                    }
-                }
-            }
-
-            /* Mark block as allocated */
-            current->free = 0;
-            heap_update_block(current);  /* Update magic and checksum */
-
-            /* Update heap usage statistics */
-            heap_used += current->size;
-
-            /* Return pointer to data (skip header) */
-            return (void*)((uint8_t*)current + sizeof(struct block_header));
-        }
-
-        current = current->next;
-    }
-
-    return NULL;  /* Out of memory - no suitable block found */
+    size_t total_size = size + sizeof(struct alloc_header);
+    
+    /* Allocate from buddy */
+    void* ptr = buddy_alloc(total_size);
+    if (!ptr) return NULL;
+    
+    /* Setup header */
+    struct alloc_header* header = (struct alloc_header*)ptr;
+    header->size = total_size;
+    header->magic = ALLOC_MAGIC;
+    
+    return (void*)(header + 1);
 }
 
-/* Free memory with double-free protection and validation */
+/* Free memory */
 void kfree(void* ptr) {
-    if (!ptr) {
+    if (!ptr) return;
+    
+    struct alloc_header* header = (struct alloc_header*)ptr - 1;
+    
+    if (header->magic != ALLOC_MAGIC) {
+        /* Corruption or invalid pointer */
         return;
     }
-
-    /* Validate pointer is within heap bounds */
-    uintptr_t ptr_addr = (uintptr_t)ptr;
-    uintptr_t heap_end = (uintptr_t)heap_start + HEAP_SIZE;
-
-    if (ptr_addr < (uintptr_t)heap_start + sizeof(struct block_header) ||
-        ptr_addr >= heap_end) {
-        /* Invalid pointer - not in heap! */
-        return;
-    }
-
-    /* Get block header */
-    struct block_header* block = (struct block_header*)((uint8_t*)ptr - sizeof(struct block_header));
-
-    /* Validate block integrity */
-    if (!heap_validate_block(block)) {
-        /* Heap corruption or invalid block! */
-        return;
-    }
-
-    /* Check for double-free */
-    if (block->free) {
-        /* Double-free detected! This is a serious bug. */
-        return;
-    }
-
-    /* Mark block as free */
-    block->free = 1;
-    heap_used -= block->size;
-    heap_update_block(block);  /* Update magic and checksum */
-
-    /* Merge with next block if it's free (coalescing) */
-    if (block->next && heap_validate_block(block->next) && block->next->free) {
-        block->size += block->next->size;
-        block->next = block->next->next;
-        if (block->next) {
-            block->next->prev = block;
-        }
-        heap_update_block(block);
-    }
-
-    /* Merge with previous block if it's free (coalescing) */
-    if (block->prev && heap_validate_block(block->prev) && block->prev->free) {
-        block->prev->size += block->size;
-        block->prev->next = block->next;
-        if (block->next) {
-            block->next->prev = block->prev;
-        }
-        heap_update_block(block->prev);
-    }
+    
+    /* Invalidate magic to detect double-free */
+    header->magic = 0;
+    
+    buddy_free((void*)header, header->size);
 }
 
 /* Reallocate memory with validation */
@@ -370,7 +270,7 @@ struct buddy_allocator {
 };
 
 static struct buddy_allocator buddy_alloc_state;
-static bool buddy_initialized = false;
+/* buddy_initialized is defined at the top of the file */
 
 /* Calculate order (log2) for a size */
 static uint32_t buddy_size_to_order(size_t size) {
@@ -477,31 +377,57 @@ int buddy_init(void* start, size_t size, uint32_t min_order, uint32_t max_order)
         return -1;
     }
 
-    buddy_alloc_state.memory_start = start;
-    buddy_alloc_state.memory_size = size;
-    buddy_alloc_state.min_order = min_order;
-    buddy_alloc_state.max_order = max_order;
-
     /* Calculate bitmap size */
     size_t max_blocks = size >> min_order;
-    buddy_alloc_state.bitmap_size = (max_blocks + 7) / 8;
+    size_t bitmap_size = (max_blocks + 7) / 8;
+    
+    /* Align bitmap size to next block boundary (min_order) to keep alignment */
+    size_t align_mask = (1 << min_order) - 1;
+    bitmap_size = (bitmap_size + align_mask) & ~align_mask;
 
-    /* Allocate bitmap using simple kmalloc */
-    buddy_alloc_state.bitmap = (uint8_t*)kmalloc(buddy_alloc_state.bitmap_size);
-    if (!buddy_alloc_state.bitmap) {
-        return -1;
+    if (bitmap_size >= size) {
+        return -1; /* Not enough memory for bitmap */
     }
 
+    /* Carve bitmap from the start of memory */
+    buddy_alloc_state.bitmap = (uint8_t*)start;
+    buddy_alloc_state.bitmap_size = bitmap_size;
+    
     /* Clear bitmap */
     memset(buddy_alloc_state.bitmap, 0, buddy_alloc_state.bitmap_size);
+
+    /* Adjust managed memory to exclude bitmap */
+    buddy_alloc_state.memory_start = (void*)((uintptr_t)start + bitmap_size);
+    buddy_alloc_state.memory_size = size - bitmap_size;
+    buddy_alloc_state.min_order = min_order;
+    buddy_alloc_state.max_order = max_order;
 
     /* Initialize free lists */
     for (uint32_t i = 0; i <= BUDDY_MAX_ORDER; i++) {
         buddy_alloc_state.free_lists[i] = NULL;
     }
 
-    /* Add initial block to maximum order free list */
-    buddy_add_to_free_list(start, max_order);
+    /* Add initial block(s) to free lists */
+    /* Since size might not be power of 2, we need to add multiple blocks */
+    /* For simplicity in Phase 1, we assume size is large enough and we just add the largest power of 2 block that fits */
+    /* TODO: Handle non-power-of-2 sizes correctly by adding multiple blocks */
+    
+    /* Find largest order that fits in remaining size */
+    size_t remaining_size = buddy_alloc_state.memory_size;
+    uintptr_t current_addr = (uintptr_t)buddy_alloc_state.memory_start;
+    
+    while (remaining_size >= (1UL << min_order)) {
+        uint32_t order = max_order;
+        while ((1UL << order) > remaining_size) {
+            order--;
+        }
+        
+        /* Add block to free list */
+        buddy_add_to_free_list((void*)current_addr, order);
+        
+        current_addr += (1UL << order);
+        remaining_size -= (1UL << order);
+    }
 
     buddy_initialized = true;
     return 0;
@@ -623,7 +549,7 @@ void buddy_free(void* ptr, size_t size) {
  * ============================================================================
  */
 
-#define SLAB_MAGIC 0x5LAB5LAB
+#define SLAB_MAGIC 0x51AB51AB
 #define SLAB_OBJECTS_PER_SLAB 64
 
 /* Slab structure */

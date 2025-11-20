@@ -15,14 +15,37 @@ struct process {
     struct process* next;
 };
 
+#include "../asm/context-switch.h"
+
+/* Priority levels */
+enum thread_priority {
+    PRIORITY_IDLE = 0,
+    PRIORITY_LOW = 1,
+    PRIORITY_NORMAL = 2,
+    PRIORITY_HIGH = 3,
+    PRIORITY_REALTIME = 4
+};
+
+/* Thread state */
+enum thread_state {
+    THREAD_READY,
+    THREAD_RUNNING,
+    THREAD_BLOCKED,
+    THREAD_SLEEPING,
+    THREAD_ZOMBIE
+};
+
 /* Thread structure */
 struct thread {
     uint32_t tid;
     struct process* process;
-    void* stack;
-    void* context;
-    uint32_t sleep_until;
+    struct cpu_context context;
+    enum thread_priority priority;
+    enum thread_state state;
+    uint64_t sleep_until;
+    uint64_t time_slice;
     struct thread* next;
+    struct thread* prev;
 };
 
 /* Global process list (for Lisp introspection) */

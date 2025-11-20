@@ -18,17 +18,7 @@ extern void interrupt_handler(uint32_t interrupt_number, void* stack_frame);
 extern void exception_handler(uint32_t exception_number, void* stack_frame);
 extern void* syscall_handler(uint32_t syscall_number, void* args);
 
-/* Multiboot 2 structures */
-struct multiboot_tag {
-    uint32_t type;
-    uint32_t size;
-};
-
-struct multiboot_info {
-    uint32_t total_size;
-    uint32_t reserved;
-    struct multiboot_tag tags[];
-};
+#include "multiboot2.h"
 
 /* Kernel panic handler */
 void kernel_panic(const char* message) {
