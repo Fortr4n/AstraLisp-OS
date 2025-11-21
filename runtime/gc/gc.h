@@ -3,47 +3,87 @@
 #ifndef GC_H
 #define GC_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
+#include "../lisp/tagged.h"
 
-/* GC statistics */
+/* GC Statistics */
 struct gc_stats {
     size_t total_allocated;
     size_t total_freed;
-    uint32_t collection_count;
+    size_t collection_count;
 };
 
-/* Initialize garbage collector */
+/* Initialize GC */
 int gc_init(void);
 
 /* Allocate object */
 void* gc_alloc(size_t size);
 
-/* Mark object as reachable */
-void gc_mark(void* obj);
+/* Mark object */
+void gc_mark(lisp_value obj);
 
-/* Run garbage collection */
+/* Run GC */
 void gc_collect(void);
 
-/*
- * Write barrier - MUST be called when modifying object references
- * This is CRITICAL for generational GC correctness!
- *
- * Usage:
- *   gc_write_barrier(obj, &obj->field, new_value);
- *   obj->field = new_value;  // Then perform the actual write
- *
- * Prevents premature collection of young objects referenced by old objects
+/* Global Roots (Global variables) */
+int gc_add_root(lisp_value* root);
+void gc_remove_root(lisp_value* root);
+
+/* Shadow Stack for Local Roots (Stack variables) */
+/* Usage:
+ * lisp_value a = ...;
+ * lisp_value b = ...;
+ * GC_PUSH_2(a, b);
+ * ... can trigger GC ...
+ * GC_POP();
  */
-void gc_write_barrier(void* obj, void** field_addr, void* new_value);
 
-/* Add root pointer */
-int gc_add_root(void** pointer);
+#define GC_MAX_ROOTS_PER_FRAME 8
 
-/* Remove root pointer */
-void gc_remove_root(void** pointer);
+struct gc_stack_frame {
+    lisp_value* roots[GC_MAX_ROOTS_PER_FRAME];
+    size_t count;
+    struct gc_stack_frame* prev;
+};
 
-/* Get GC statistics */
+void gc_push_frame(struct gc_stack_frame* frame);
+void gc_pop_frame(void);
+
+/* Macros for convenience */
+#define GC_PUSH_1(v1) \
+    do { \
+        struct gc_stack_frame _frame; \
+        _frame.roots[0] = &(v1); \
+        _frame.count = 1; \
+        gc_push_frame(&_frame); \
+    } while(0)
+
+#define GC_PUSH_2(v1, v2) \
+    do { \
+        struct gc_stack_frame _frame; \
+        _frame.roots[0] = &(v1); \
+        _frame.roots[1] = &(v2); \
+        _frame.count = 2; \
+        gc_push_frame(&_frame); \
+    } while(0)
+
+#define GC_PUSH_3(v1, v2, v3) \
+    do { \
+        struct gc_stack_frame _frame; \
+        _frame.roots[0] = &(v1); \
+        _frame.roots[1] = &(v2); \
+        _frame.roots[2] = &(v3); \
+        _frame.count = 3; \
+        gc_push_frame(&_frame); \
+    } while(0)
+
+#define GC_POP() gc_pop_frame()
+
+/* Write Barrier */
+void gc_write_barrier(lisp_value obj, lisp_value* field, lisp_value new_val);
+
+/* Get Stats */
 void gc_get_stats(struct gc_stats* stats);
 
 #endif /* GC_H */

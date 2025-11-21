@@ -3,45 +3,57 @@
 #ifndef TYPES_H
 #define TYPES_H
 
-#include "reader.h"
+#include "tagged.h"
+#include "objects.h"
 #include <stdbool.h>
 
-/* Type predicate */
-typedef bool (*type_predicate_t)(struct lisp_object* obj);
+/* Type predicates (Inline functions) */
+static inline bool is_cons(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_CONS;
+}
 
-/* Type information */
-struct lisp_type {
-    char* name;
-    type_predicate_t predicate;
-    struct lisp_type* parent;
-    struct lisp_type* next;
-};
+static inline bool is_symbol(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_SYMBOL;
+}
 
-/* Type system */
-struct type_system {
-    struct lisp_type* types;
-    struct lisp_object* type_registry;
-};
+static inline bool is_string(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_STRING;
+}
 
-/* Initialize type system */
-int type_system_init(struct type_system* ts);
+static inline bool is_vector(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_VECTOR;
+}
 
-/* Register type */
-int type_register(struct type_system* ts, const char* name, type_predicate_t predicate, const char* parent);
+static inline bool is_function(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_FUNCTION;
+}
 
-/* Check type */
-bool type_check(struct type_system* ts, struct lisp_object* obj, const char* type_name);
+static inline bool is_integer(lisp_value obj) {
+    return IS_FIXNUM(obj);
+}
 
-/* Get type name */
-const char* type_get_name(struct type_system* ts, struct lisp_object* obj);
+static inline bool is_character(lisp_value obj) {
+    return IS_CHAR(obj);
+}
 
-/* Type predicates */
-bool type_integer_p(struct lisp_object* obj);
-bool type_string_p(struct lisp_object* obj);
-bool type_symbol_p(struct lisp_object* obj);
-bool type_cons_p(struct lisp_object* obj);
-bool type_list_p(struct lisp_object* obj);
-bool type_function_p(struct lisp_object* obj);
-bool type_macro_p(struct lisp_object* obj);
+static inline bool is_nil(lisp_value obj) {
+    return IS_NIL(obj);
+}
+
+static inline bool is_t(lisp_value obj) {
+    return IS_T(obj);
+}
+
+/* Uppercase Macros for consistency/legacy support */
+#define IS_CONS(x)      is_cons(x)
+#define IS_SYMBOL(x)    is_symbol(x)
+#define IS_STRING(x)    is_string(x)
+#define IS_VECTOR(x)    is_vector(x)
+#define IS_FUNCTION(x)  is_function(x)
+/* IS_INTEGER, IS_CHAR, IS_NIL, IS_T are usually defined in tagged.h or here */
+/* If tagged.h defines IS_FIXNUM, we can alias IS_INTEGER */
+#ifndef IS_INTEGER
+#define IS_INTEGER(x)   IS_FIXNUM(x)
+#endif
 
 #endif /* TYPES_H */

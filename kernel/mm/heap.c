@@ -249,7 +249,7 @@ void* kmalloc_aligned(size_t size, size_t alignment) {
  * ============================================================================
  */
 
-#define BUDDY_MAX_ORDER 20
+#define BUDDY_MAX_ORDER 30
 #define BUDDY_MIN_ORDER 4   /* Minimum block size = 2^4 = 16 bytes */
 
 /* Free block node in buddy system */

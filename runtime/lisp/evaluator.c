@@ -1,826 +1,488 @@
-/* AstraLisp OS Lisp Evaluator Implementation */
+/* AstraLisp OS Evaluator Implementation */
 
 #include "evaluator.h"
-#include "../../kernel/mm/heap.h"
-#include "../../runtime/gc/gc.h"
-#include <stddef.h>
+#include "objects.h"
+#include "types.h"
+#include "hashtable.h"
+#include "../gc/gc.h"
 #include <string.h>
-#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-static struct lisp_environment* global_env = NULL;
+/* Global environment */
+static lisp_value global_env = LISP_NIL;
 
-/*
- * ============================================================================
- * HASH TABLE IMPLEMENTATION FOR ENVIRONMENT BINDINGS
- * ============================================================================
- */
-
-#define ENV_HASH_INITIAL_CAPACITY 16
-#define ENV_HASH_LOAD_FACTOR 0.75f
-#define ENV_HASH_MAX_CHAIN_LENGTH 8
-
-/* FNV-1a hash function for strings (32-bit) */
-static uint32_t hash_string_fnv1a(const char* str) {
-    if (!str) {
-        return 0;
-    }
-
-    uint32_t hash = 2166136261u;  /* FNV offset basis */
-    const uint8_t* bytes = (const uint8_t*)str;
-
-    while (*bytes) {
-        hash ^= *bytes++;
-        hash *= 16777619u;  /* FNV prime */
-    }
-
-    return hash;
+/* Helper predicate for environment type */
+static inline bool is_env(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_ENV;
 }
 
-/* Hash symbol for hash table */
-static uint32_t hash_symbol(struct lisp_object* symbol) {
-    if (!symbol || symbol->type != LISP_SYMBOL || !symbol->value.symbol.name) {
-        return 0;
-    }
-
-    return hash_string_fnv1a(symbol->value.symbol.name);
-}
-
-/* Create hash table */
-struct env_hash_table* env_hash_create(uint32_t initial_capacity) {
-    if (initial_capacity < 4) {
-        initial_capacity = ENV_HASH_INITIAL_CAPACITY;
-    }
-
-    /* Round up to next power of 2 for efficient modulo */
-    uint32_t capacity = 4;
-    while (capacity < initial_capacity) {
-        capacity *= 2;
-    }
-
-    struct env_hash_table* table = (struct env_hash_table*)kmalloc(sizeof(struct env_hash_table));
-    if (!table) {
-        return NULL;
-    }
-
-    table->buckets = (struct env_hash_entry**)kmalloc(capacity * sizeof(struct env_hash_entry*));
-    if (!table->buckets) {
-        kfree(table);
-        return NULL;
-    }
-
-    /* Initialize all buckets to NULL */
-    for (uint32_t i = 0; i < capacity; i++) {
-        table->buckets[i] = NULL;
-    }
-
-    table->bucket_count = capacity;
-    table->entry_count = 0;
-    table->load_factor = ENV_HASH_LOAD_FACTOR;
-
-    return table;
-}
-
-/* Destroy hash table */
-void env_hash_destroy(struct env_hash_table* table) {
-    if (!table) {
-        return;
-    }
-
-    /* Free all entries */
-    for (uint32_t i = 0; i < table->bucket_count; i++) {
-        struct env_hash_entry* entry = table->buckets[i];
-        while (entry) {
-            struct env_hash_entry* next = entry->next;
-
-            /* Decrement reference counts */
-            if (entry->key) {
-                lisp_decref(entry->key);
-            }
-            if (entry->value) {
-                lisp_decref(entry->value);
-            }
-
-            kfree(entry);
-            entry = next;
-        }
-    }
-
-    kfree(table->buckets);
-    kfree(table);
-}
-
-/* Get value from hash table */
-struct lisp_object* env_hash_get(struct env_hash_table* table, struct lisp_object* key) {
-    if (!table || !key || key->type != LISP_SYMBOL) {
-        return NULL;
-    }
-
-    uint32_t hash = hash_symbol(key);
-    uint32_t index = hash & (table->bucket_count - 1);  /* Efficient modulo for power of 2 */
-
-    struct env_hash_entry* entry = table->buckets[index];
-    while (entry) {
-        /* Check hash first (fast path) */
-        if (entry->hash == hash) {
-            /* Verify key equality */
-            if (entry->key && entry->key->type == LISP_SYMBOL &&
-                key->value.symbol.name && entry->key->value.symbol.name &&
-                strcmp(key->value.symbol.name, entry->key->value.symbol.name) == 0) {
-                return entry->value;
-            }
-        }
-        entry = entry->next;
-    }
-
-    return NULL;
-}
-
-/* Resize hash table */
-void env_hash_resize(struct env_hash_table* table, uint32_t new_capacity) {
-    if (!table || new_capacity < 4) {
-        return;
-    }
-
-    /* Round up to next power of 2 */
-    uint32_t capacity = 4;
-    while (capacity < new_capacity) {
-        capacity *= 2;
-    }
-
-    /* Allocate new bucket array */
-    struct env_hash_entry** new_buckets = (struct env_hash_entry**)kmalloc(
-        capacity * sizeof(struct env_hash_entry*));
-    if (!new_buckets) {
-        return;  /* Resize failed - continue with old table */
-    }
-
-    /* Initialize new buckets */
-    for (uint32_t i = 0; i < capacity; i++) {
-        new_buckets[i] = NULL;
-    }
-
-    /* Rehash all entries */
-    for (uint32_t i = 0; i < table->bucket_count; i++) {
-        struct env_hash_entry* entry = table->buckets[i];
-        while (entry) {
-            struct env_hash_entry* next = entry->next;
-
-            /* Rehash to new bucket */
-            uint32_t new_index = entry->hash & (capacity - 1);
-            entry->next = new_buckets[new_index];
-            new_buckets[new_index] = entry;
-
-            entry = next;
-        }
-    }
-
-    /* Replace old buckets with new */
-    kfree(table->buckets);
-    table->buckets = new_buckets;
-    table->bucket_count = capacity;
-}
-
-/* Put value into hash table (insert new entry) */
-int env_hash_put(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value) {
-    if (!table || !key || key->type != LISP_SYMBOL || !value) {
-        return -1;
-    }
-
-    /* Check if resize needed */
-    float current_load = (float)table->entry_count / (float)table->bucket_count;
-    if (current_load > table->load_factor) {
-        env_hash_resize(table, table->bucket_count * 2);
-    }
-
-    uint32_t hash = hash_symbol(key);
-    uint32_t index = hash & (table->bucket_count - 1);
-
-    /* Check for duplicate key */
-    struct env_hash_entry* existing = table->buckets[index];
-    while (existing) {
-        if (existing->hash == hash) {
-            if (existing->key && existing->key->type == LISP_SYMBOL &&
-                key->value.symbol.name && existing->key->value.symbol.name &&
-                strcmp(key->value.symbol.name, existing->key->value.symbol.name) == 0) {
-                /* Key already exists - update value */
-                if (existing->value) {
-                    lisp_decref(existing->value);
-                }
-                existing->value = value;
-                lisp_incref(value);
-                return 0;
-            }
-        }
-        existing = existing->next;
-    }
-
-    /* Create new entry */
-    struct env_hash_entry* entry = (struct env_hash_entry*)kmalloc(sizeof(struct env_hash_entry));
-    if (!entry) {
-        return -1;
-    }
-
-    entry->key = key;
-    entry->value = value;
-    entry->hash = hash;
-    entry->next = table->buckets[index];
-
-    /* Increment reference counts */
-    lisp_incref(key);
-    lisp_incref(value);
-
-    /* Insert at head of chain */
-    table->buckets[index] = entry;
-    table->entry_count++;
-
-    return 0;
-}
-
-/* Update existing value in hash table */
-int env_hash_update(struct env_hash_table* table, struct lisp_object* key, struct lisp_object* value) {
-    if (!table || !key || key->type != LISP_SYMBOL || !value) {
-        return -1;
-    }
-
-    uint32_t hash = hash_symbol(key);
-    uint32_t index = hash & (table->bucket_count - 1);
-
-    struct env_hash_entry* entry = table->buckets[index];
-    while (entry) {
-        if (entry->hash == hash) {
-            if (entry->key && entry->key->type == LISP_SYMBOL &&
-                key->value.symbol.name && entry->key->value.symbol.name &&
-                strcmp(key->value.symbol.name, entry->key->value.symbol.name) == 0) {
-                /* Found - update value */
-                if (entry->value) {
-                    lisp_decref(entry->value);
-                }
-                entry->value = value;
-                lisp_incref(value);
-                return 0;
-            }
-        }
-        entry = entry->next;
-    }
-
-    return -1;  /* Key not found */
-}
-
-/* Built-in function table */
-struct builtin_entry {
-    char* name;
-    struct lisp_object* (*func)(struct lisp_object*, struct lisp_environment*);
-    struct builtin_entry* next;
-};
-
-static struct builtin_entry* builtin_table = NULL;
-
-/* Create environment */
-struct lisp_environment* env_create(struct lisp_environment* parent) {
-    struct lisp_environment* env = (struct lisp_environment*)kmalloc(sizeof(struct lisp_environment));
-    if (!env) {
-        return NULL;
-    }
-
-    env->bindings = env_hash_create(ENV_HASH_INITIAL_CAPACITY);
-    if (!env->bindings) {
-        kfree(env);
-        return NULL;
-    }
-
-    env->parent = parent;
-
-    return env;
-}
-
-/* Destroy environment */
-void env_destroy(struct lisp_environment* env) {
-    if (!env) {
-        return;
-    }
-
-    /* Destroy hash table (this decrements all referenced objects) */
-    if (env->bindings) {
-        env_hash_destroy(env->bindings);
-    }
-
-    /* Note: We don't destroy parent - parent is managed separately */
-    kfree(env);
-}
-
-/* Lookup variable */
-struct lisp_object* env_lookup(struct lisp_environment* env, struct lisp_object* symbol) {
-    if (!env || !symbol || symbol->type != LISP_SYMBOL) {
-        return NULL;
-    }
-
-    /* Search current environment and all parents */
-    struct lisp_environment* current = env;
-    while (current) {
-        if (current->bindings) {
-            struct lisp_object* value = env_hash_get(current->bindings, symbol);
-            if (value) {
-                return value;
-            }
-        }
-        current = current->parent;
-    }
-
-    return NULL;
-}
-
-/* Define variable */
-int env_define(struct lisp_environment* env, struct lisp_object* symbol, struct lisp_object* value) {
-    if (!env || !symbol || symbol->type != LISP_SYMBOL || !value) {
-        return -1;
-    }
-
-    if (!env->bindings) {
-        env->bindings = env_hash_create(ENV_HASH_INITIAL_CAPACITY);
-        if (!env->bindings) {
-            return -1;
-        }
-    }
-
-    return env_hash_put(env->bindings, symbol, value);
-}
-
-/* Set variable */
-int env_set(struct lisp_environment* env, struct lisp_object* symbol, struct lisp_object* value) {
-    if (!env || !symbol || symbol->type != LISP_SYMBOL || !value) {
-        return -1;
-    }
-
-    /* Search current environment and all parents for existing binding */
-    struct lisp_environment* current = env;
-    while (current) {
-        if (current->bindings) {
-            /* Check if symbol exists in this environment */
-            struct lisp_object* existing = env_hash_get(current->bindings, symbol);
-            if (existing) {
-                /* Update existing binding */
-                return env_hash_update(current->bindings, symbol, value);
-            }
-        }
-        current = current->parent;
-    }
-
-    return -1;  /* Symbol not found in any environment */
-}
-
-/* Evaluate expression */
-struct lisp_object* lisp_eval(struct lisp_object* expr, struct lisp_environment* env) {
-    if (!expr || !env) {
-        return NULL;
-    }
-    
-    /* Self-evaluating forms */
-    if (expr->type == LISP_INTEGER || expr->type == LISP_FLOAT || 
-        expr->type == LISP_STRING || expr->type == LISP_NIL) {
-        lisp_incref(expr);
-        return expr;
-    }
-    
-    /* Symbol lookup */
-    if (expr->type == LISP_SYMBOL) {
-        struct lisp_object* value = env_lookup(env, expr);
-        if (value) {
-            lisp_incref(value);
-            return value;
-        }
-        /* Check built-ins */
-        struct builtin_entry* entry = builtin_table;
-        while (entry) {
-            if (strcmp(expr->value.symbol.name, entry->name) == 0) {
-                struct lisp_object* func_obj = lisp_create_object(LISP_FUNCTION);
-                if (func_obj) {
-                    func_obj->value.function.is_macro = false;
-                    /* Store built-in pointer */
-                }
-                return func_obj;
-            }
-            entry = entry->next;
-        }
-        return NULL;
-    }
-    
-    /* Function call */
-    if (expr->type == LISP_CONS) {
-        struct lisp_object* car = expr->value.cons.car;
-        struct lisp_object* cdr = expr->value.cons.cdr;
-        
-        if (!car) {
-            return lisp_nil();
-        }
-        
-        /* Special forms */
-        if (car->type == LISP_SYMBOL) {
-            if (strcmp(car->value.symbol.name, "quote") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* quoted = cdr->value.cons.car;
-                    lisp_incref(quoted);
-                    return quoted;
-                }
-            } else if (strcmp(car->value.symbol.name, "if") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* condition = lisp_eval(cdr->value.cons.car, env);
-                    struct lisp_object* then_expr = NULL;
-                    struct lisp_object* else_expr = NULL;
-                    
-                    if (cdr->value.cons.cdr && cdr->value.cons.cdr->type == LISP_CONS) {
-                        then_expr = cdr->value.cons.cdr->value.cons.car;
-                        if (cdr->value.cons.cdr->value.cons.cdr && 
-                            cdr->value.cons.cdr->value.cons.cdr->type == LISP_CONS) {
-                            else_expr = cdr->value.cons.cdr->value.cons.cdr->value.cons.car;
-                        }
-                    }
-                    
-                    bool condition_true = false;
-                    if (condition) {
-                        if (condition->type == LISP_NIL) {
-                            condition_true = false;
-                        } else {
-                            condition_true = true;
-                        }
-                        lisp_decref(condition);
-                    }
-                    
-                    if (condition_true && then_expr) {
-                        return lisp_eval(then_expr, env);
-                    } else if (!condition_true && else_expr) {
-                        return lisp_eval(else_expr, env);
-                    }
-                    return lisp_nil();
-                }
-            } else if (strcmp(car->value.symbol.name, "lambda") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* params = cdr->value.cons.car;
-                    struct lisp_object* body = NULL;
-                    if (cdr->value.cons.cdr && cdr->value.cons.cdr->type == LISP_CONS) {
-                        body = cdr->value.cons.cdr->value.cons.car;
-                    }
-                    
-                    struct lisp_object* func = lisp_create_object(LISP_FUNCTION);
-                    if (func) {
-                        func->value.function.params = params;
-                        lisp_incref(params);
-                        func->value.function.body = body;
-                        if (body) {
-                            lisp_incref(body);
-                        }
-                        func->value.function.env = env;
-                        lisp_incref(env);
-                        func->value.function.is_macro = false;
-                    }
-                    return func;
-                }
-            } else if (strcmp(car->value.symbol.name, "defun") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* name = cdr->value.cons.car;
-                    struct lisp_object* params = NULL;
-                    struct lisp_object* body = NULL;
-                    
-                    if (cdr->value.cons.cdr && cdr->value.cons.cdr->type == LISP_CONS) {
-                        params = cdr->value.cons.cdr->value.cons.car;
-                        if (cdr->value.cons.cdr->value.cons.cdr && 
-                            cdr->value.cons.cdr->value.cons.cdr->type == LISP_CONS) {
-                            body = cdr->value.cons.cdr->value.cons.cdr->value.cons.car;
-                        }
-                    }
-                    
-                    if (name && name->type == LISP_SYMBOL && body) {
-                        struct lisp_object* func = lisp_create_object(LISP_FUNCTION);
-                        if (func) {
-                            func->value.function.params = params;
-                            if (params) {
-                                lisp_incref(params);
-                            }
-                            func->value.function.body = body;
-                            lisp_incref(body);
-                            func->value.function.env = env;
-                            lisp_incref(env);
-                            func->value.function.is_macro = false;
-                            
-                            env_define(env, name, func);
-                            return func;
-                        }
-                    }
-                }
-            } else if (strcmp(car->value.symbol.name, "setq") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* symbol = cdr->value.cons.car;
-                    struct lisp_object* value_expr = NULL;
-                    if (cdr->value.cons.cdr && cdr->value.cons.cdr->type == LISP_CONS) {
-                        value_expr = cdr->value.cons.cdr->value.cons.car;
-                    }
-                    
-                    if (symbol && symbol->type == LISP_SYMBOL && value_expr) {
-                        struct lisp_object* value = lisp_eval(value_expr, env);
-                        if (value) {
-                            env_set(env, symbol, value);
-                            return value;
-                        }
-                    }
-                }
-            } else if (strcmp(car->value.symbol.name, "let") == 0) {
-                if (cdr && cdr->type == LISP_CONS) {
-                    struct lisp_object* bindings = cdr->value.cons.car;
-                    struct lisp_object* body = NULL;
-                    if (cdr->value.cons.cdr && cdr->value.cons.cdr->type == LISP_CONS) {
-                        body = cdr->value.cons.cdr->value.cons.car;
-                    }
-                    
-                    struct lisp_environment* let_env = env_create(env);
-                    if (let_env && bindings) {
-                        struct lisp_object* binding = bindings;
-                        while (binding && binding->type == LISP_CONS) {
-                            struct lisp_object* binding_pair = binding->value.cons.car;
-                            if (binding_pair && binding_pair->type == LISP_CONS) {
-                                struct lisp_object* var = binding_pair->value.cons.car;
-                                struct lisp_object* val_expr = NULL;
-                                if (binding_pair->value.cons.cdr && 
-                                    binding_pair->value.cons.cdr->type == LISP_CONS) {
-                                    val_expr = binding_pair->value.cons.cdr->value.cons.car;
-                                }
-                                
-                                if (var && var->type == LISP_SYMBOL && val_expr) {
-                                    struct lisp_object* val = lisp_eval(val_expr, env);
-                                    if (val) {
-                                        env_define(let_env, var, val);
-                                    }
-                                }
-                            }
-                            binding = binding->value.cons.cdr;
-                        }
-                        
-                        if (body) {
-                            return lisp_eval(body, let_env);
-                        }
-                    }
-                }
-            }
-        }
-        
-        /* Function call */
-        struct lisp_object* func = lisp_eval(car, env);
-        if (!func) {
-            return NULL;
-        }
-        
-        /* Evaluate arguments */
-        struct lisp_object* args = lisp_nil();
-        struct lisp_object* arg_list = cdr;
-        while (arg_list && arg_list->type == LISP_CONS) {
-            struct lisp_object* arg = lisp_eval(arg_list->value.cons.car, env);
-            if (arg) {
-                args = lisp_create_cons(arg, args);
-            }
-            arg_list = arg_list->value.cons.cdr;
-        }
-        
-        struct lisp_object* result = lisp_apply(func, args, env);
-        lisp_decref(func);
-        lisp_decref(args);
-        
-        return result;
-    }
-    
-    return NULL;
-}
-
-/* Apply function */
-struct lisp_object* lisp_apply(struct lisp_object* func, struct lisp_object* args, struct lisp_environment* env) {
-    if (!func || !args) {
-        return NULL;
-    }
-    
-    if (func->type == LISP_FUNCTION) {
-        /* User-defined function */
-        struct lisp_environment* func_env = env_create(func->value.function.env);
-        if (!func_env) {
-            return NULL;
-        }
-        
-        /* Bind parameters */
-        struct lisp_object* params = func->value.function.params;
-        struct lisp_object* arg = args;
-        
-        while (params && params->type == LISP_CONS && arg && arg->type == LISP_CONS) {
-            struct lisp_object* param = params->value.cons.car;
-            struct lisp_object* arg_val = arg->value.cons.car;
-            
-            if (param && param->type == LISP_SYMBOL) {
-                env_define(func_env, param, arg_val);
-            }
-            
-            params = params->value.cons.cdr;
-            arg = arg->value.cons.cdr;
-        }
-        
-        /* Evaluate body */
-        struct lisp_object* result = lisp_eval(func->value.function.body, func_env);
-        
-        return result;
-    }
-    
-    return NULL;
-}
-
-/* Built-in functions */
-struct lisp_object* lisp_builtin_car(struct lisp_object* args, struct lisp_environment* env) {
-    if (args && args->type == LISP_CONS) {
-        struct lisp_object* list = args->value.cons.car;
-        if (list && list->type == LISP_CONS) {
-            struct lisp_object* car = list->value.cons.car;
-            lisp_incref(car);
-            return car;
-        }
-    }
-    return lisp_nil();
-}
-
-struct lisp_object* lisp_builtin_cdr(struct lisp_object* args, struct lisp_environment* env) {
-    if (args && args->type == LISP_CONS) {
-        struct lisp_object* list = args->value.cons.car;
-        if (list && list->type == LISP_CONS) {
-            struct lisp_object* cdr = list->value.cons.cdr;
-            lisp_incref(cdr);
-            return cdr;
-        }
-    }
-    return lisp_nil();
-}
-
-struct lisp_object* lisp_builtin_cons(struct lisp_object* args, struct lisp_environment* env) {
-    if (args && args->type == LISP_CONS) {
-        struct lisp_object* car = args->value.cons.car;
-        struct lisp_object* cdr = NULL;
-        if (args->value.cons.cdr && args->value.cons.cdr->type == LISP_CONS) {
-            cdr = args->value.cons.cdr->value.cons.car;
-        }
-        return lisp_create_cons(car, cdr);
-    }
-    return lisp_nil();
-}
-
-struct lisp_object* lisp_builtin_eq(struct lisp_object* args, struct lisp_environment* env) {
-    if (args && args->type == LISP_CONS) {
-        struct lisp_object* a = args->value.cons.car;
-        struct lisp_object* b = NULL;
-        if (args->value.cons.cdr && args->value.cons.cdr->type == LISP_CONS) {
-            b = args->value.cons.cdr->value.cons.car;
-        }
-        if (a && b && lisp_equal(a, b)) {
-            return lisp_create_integer(1);
-        }
-    }
-    return lisp_nil();
-}
-
-struct lisp_object* lisp_builtin_add(struct lisp_object* args, struct lisp_environment* env) {
-    int64_t sum = 0;
-    struct lisp_object* arg = args;
-    while (arg && arg->type == LISP_CONS) {
-        struct lisp_object* val = arg->value.cons.car;
-        if (val && val->type == LISP_INTEGER) {
-            sum += val->value.integer;
-        }
-        arg = arg->value.cons.cdr;
-    }
-    return lisp_create_integer(sum);
-}
-
-struct lisp_object* lisp_builtin_sub(struct lisp_object* args, struct lisp_environment* env) {
-    if (!args || args->type != LISP_CONS) {
-        return lisp_nil();
-    }
-    
-    struct lisp_object* first = args->value.cons.car;
-    if (!first || first->type != LISP_INTEGER) {
-        return lisp_nil();
-    }
-    
-    int64_t result = first->value.integer;
-    struct lisp_object* arg = args->value.cons.cdr;
-    
-    if (!arg || arg->type != LISP_CONS) {
-        return lisp_create_integer(-result);
-    }
-    
-    while (arg && arg->type == LISP_CONS) {
-        struct lisp_object* val = arg->value.cons.car;
-        if (val && val->type == LISP_INTEGER) {
-            result -= val->value.integer;
-        }
-        arg = arg->value.cons.cdr;
-    }
-    
-    return lisp_create_integer(result);
-}
-
-struct lisp_object* lisp_builtin_mul(struct lisp_object* args, struct lisp_environment* env) {
-    int64_t product = 1;
-    struct lisp_object* arg = args;
-    while (arg && arg->type == LISP_CONS) {
-        struct lisp_object* val = arg->value.cons.car;
-        if (val && val->type == LISP_INTEGER) {
-            product *= val->value.integer;
-        }
-        arg = arg->value.cons.cdr;
-    }
-    return lisp_create_integer(product);
-}
-
-struct lisp_object* lisp_builtin_div(struct lisp_object* args, struct lisp_environment* env) {
-    if (!args || args->type != LISP_CONS) {
-        return lisp_nil();
-    }
-    
-    struct lisp_object* first = args->value.cons.car;
-    if (!first || first->type != LISP_INTEGER) {
-        return lisp_nil();
-    }
-    
-    int64_t result = first->value.integer;
-    struct lisp_object* arg = args->value.cons.cdr;
-    
-    while (arg && arg->type == LISP_CONS) {
-        struct lisp_object* val = arg->value.cons.car;
-        if (val && val->type == LISP_INTEGER && val->value.integer != 0) {
-            result /= val->value.integer;
-        } else {
-            return lisp_nil();
-        }
-        arg = arg->value.cons.cdr;
-    }
-    
-    return lisp_create_integer(result);
-}
-
-struct lisp_object* lisp_builtin_list(struct lisp_object* args, struct lisp_environment* env) {
-    return args;  /* Arguments are already a list */
-}
-
-struct lisp_object* lisp_builtin_length(struct lisp_object* args, struct lisp_environment* env) {
-    if (!args || args->type != LISP_CONS) {
-        return lisp_create_integer(0);
-    }
-    
-    size_t len = 0;
-    struct lisp_object* list = args->value.cons.car;
-    while (list && list->type == LISP_CONS) {
-        len++;
-        list = list->value.cons.cdr;
-    }
-    
-    return lisp_create_integer(len);
-}
-
-struct lisp_object* lisp_builtin_print(struct lisp_object* args, struct lisp_environment* env) {
-    struct lisp_object* arg = args;
-    while (arg && arg->type == LISP_CONS) {
-        struct lisp_object* obj = arg->value.cons.car;
-        lisp_print(obj);
-        arg = arg->value.cons.cdr;
-    }
-    return lisp_nil();
-}
-
-/* Register built-in */
-void lisp_register_builtin(const char* name, struct lisp_object* (*func)(struct lisp_object*, struct lisp_environment*)) {
-    struct builtin_entry* entry = (struct builtin_entry*)kmalloc(sizeof(struct builtin_entry));
-    if (entry) {
-        entry->name = (char*)kmalloc(strlen(name) + 1);
-        if (entry->name) {
-            strcpy(entry->name, name);
-            entry->func = func;
-            entry->next = builtin_table;
-            builtin_table = entry;
-        } else {
-            kfree(entry);
-        }
-    }
-}
+#define IS_ENV(x) is_env(x)
 
 /* Initialize evaluator */
 int evaluator_init(void) {
-    global_env = env_create(NULL);
-    if (!global_env) {
-        return -1;
-    }
+    /* Create global environment */
+    /* We need to register global_env as a root since it persists */
+    gc_add_root(&global_env);
+    
+    global_env = lisp_env_create(LISP_NIL);
     
     /* Register built-ins */
-    lisp_register_builtin("car", lisp_builtin_car);
-    lisp_register_builtin("cdr", lisp_builtin_cdr);
-    lisp_register_builtin("cons", lisp_builtin_cons);
-    lisp_register_builtin("eq", lisp_builtin_eq);
-    lisp_register_builtin("+", lisp_builtin_add);
-    lisp_register_builtin("-", lisp_builtin_sub);
-    lisp_register_builtin("*", lisp_builtin_mul);
-    lisp_register_builtin("/", lisp_builtin_div);
-    lisp_register_builtin("list", lisp_builtin_list);
-    lisp_register_builtin("length", lisp_builtin_length);
-    lisp_register_builtin("print", lisp_builtin_print);
+    lisp_register_builtin("car", builtin_car);
+    lisp_register_builtin("cdr", builtin_cdr);
+    lisp_register_builtin("cons", builtin_cons);
+    lisp_register_builtin("quote", builtin_quote);
+    lisp_register_builtin("atom", builtin_atom);
+    lisp_register_builtin("eq", builtin_eq);
+    lisp_register_builtin("cond", builtin_cond);
+    lisp_register_builtin("lambda", builtin_lambda);
+    lisp_register_builtin("defun", builtin_defun);
+    lisp_register_builtin("setq", builtin_setq);
+    lisp_register_builtin("+", builtin_plus);
+    lisp_register_builtin("-", builtin_minus);
+    lisp_register_builtin("*", builtin_times);
+    lisp_register_builtin("/", builtin_divide);
+    lisp_register_builtin("print", builtin_print);
+    
+    /* Register T and NIL in global env */
+    lisp_env_bind(global_env, lisp_create_symbol("t"), LISP_T);
+    lisp_env_bind(global_env, lisp_create_symbol("nil"), LISP_NIL);
     
     return 0;
+}
+
+/* Create new environment */
+lisp_value lisp_env_create(lisp_value parent) {
+    struct lisp_env* env = (struct lisp_env*)gc_alloc(sizeof(struct lisp_env));
+    if (!env) return LISP_NIL;
+    
+    SET_TYPE(&env->header, TYPE_ENV);
+    
+    env->parent = parent;
+    env->table = ht_create(16); /* Initial capacity */
+    
+    lisp_value val = PTR_TO_VAL(env);
+    gc_write_barrier(val, &env->parent, parent);
+    /* Note: table is not a Lisp object, so no write barrier needed for the pointer itself,
+       but its contents need tracing. */
+       
+    return val;
+}
+
+/* Bind variable in environment */
+void lisp_env_bind(lisp_value env, lisp_value symbol, lisp_value value) {
+    if (!IS_ENV(env)) return;
+    
+    struct lisp_env* e = (struct lisp_env*)PTR_VAL(env);
+    if (!e->table) return;
+    
+    ht_put(e->table, symbol, value);
+    /* Write barrier? The table is internal. The GC needs to scan the table. 
+       Since we modified the table which is reachable from 'env', and 'value' is new,
+       we should technically trigger a barrier if 'env' is old and 'value' is young.
+       But 'table' is opaque to the write barrier function unless we expose it.
+       
+       For now, we rely on the fact that if 'env' is old, we might need to mark it dirty?
+       Or we just treat the table as part of the object.
+       
+       Actually, since 'table' is malloc'd separately (not gc_alloc'd), it's not in the heap.
+       So the write barrier logic for "Old Object -> Young Object" applies to 'env' -> 'value'.
+       But 'value' is inside 'table'.
+       
+       We should probably manually call write barrier for 'env' if we can't point to the specific slot.
+       Or, we can just assume the GC scans 'env' -> 'table' -> 'value'.
+       If 'env' is OLD, and we write a YOUNG 'value' into 'table', we need to record 'env' in remembered set.
+       
+       Let's conservatively call gc_write_barrier with a dummy slot or just add to remembered set directly?
+       gc_write_barrier(env, NULL, value) might work if we update it to handle NULL field.
+       
+       Let's just call it with &e->parent as a proxy, or better, expose a way to mark object dirty.
+       For now, I'll use a hack: pass &e->parent even though we aren't writing there, 
+       just to trigger the check "is env old? is value young?".
+       Wait, gc_write_barrier checks address of field to see if it's within the object? 
+       No, it usually just checks if obj is old and new_val is young.
+       
+       Let's check gc_write_barrier implementation in gc.c (I viewed it earlier).
+       It takes (obj, field, new_value). It doesn't seem to verify field is inside obj, 
+       but it might use it for card marking if we had card marking.
+       We have card marking? "mark_card_dirty(obj_ptr)".
+       So passing &e->parent is safe enough to mark the object dirty.
+    */
+    gc_write_barrier(env, &e->parent, value);
+}
+
+/* Lookup variable in environment */
+lisp_value lisp_env_lookup(lisp_value env, lisp_value symbol) {
+    while (IS_ENV(env)) {
+        struct lisp_env* e = (struct lisp_env*)PTR_VAL(env);
+        
+        if (e->table && ht_contains(e->table, symbol)) {
+            return ht_get(e->table, symbol);
+        }
+        
+        env = e->parent;
+    }
+    
+    /* Not found */
+    printf("Error: Unbound variable: ");
+    lisp_print(symbol);
+    printf("\n");
+    return LISP_NIL;
+}
+
+/* Set variable in environment */
+void lisp_env_set(lisp_value env, lisp_value symbol, lisp_value value) {
+    lisp_value curr = env;
+    while (IS_ENV(curr)) {
+        struct lisp_env* e = (struct lisp_env*)PTR_VAL(curr);
+        
+        if (e->table && ht_contains(e->table, symbol)) {
+            ht_put(e->table, symbol, value);
+            gc_write_barrier(curr, &e->parent, value); /* Mark dirty */
+            return;
+        }
+        
+        curr = e->parent;
+    }
+    
+    /* Not found */
+    printf("Error: Cannot set unbound variable: ");
+    lisp_print(symbol);
+    printf("\n");
+}
+
+/* Apply function */
+lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
+    /* GC Protection for inputs */
+    GC_PUSH_3(env, func, args);
+    
+    lisp_value result = LISP_NIL;
+    
+    if (IS_FUNCTION(func)) {
+        struct lisp_function* f = (struct lisp_function*)PTR_VAL(func);
+        lisp_value params = f->args;
+        lisp_value body = f->code;
+        lisp_value closure_env = f->env;
+        
+        /* Create new environment extending closure_env */
+        lisp_value new_env = lisp_env_create(closure_env);
+        GC_PUSH_1(new_env); /* Protect new_env */
+        
+        /* Bind arguments */
+        lisp_value p = params;
+        lisp_value a = args;
+        
+        while (IS_CONS(p) && IS_CONS(a)) {
+            lisp_env_bind(new_env, CAR(p), CAR(a));
+            p = CDR(p);
+            a = CDR(a);
+        }
+        
+        /* Evaluate body */
+        while (IS_CONS(body)) {
+            result = lisp_eval(new_env, CAR(body));
+            body = CDR(body);
+        }
+        
+        GC_POP(); /* new_env */
+    } else {
+        printf("Error: Not a function: ");
+        lisp_print(func);
+        printf("\n");
+    }
+    
+    GC_POP(); /* env, func, args */
+    return result;
+}
+
+/* Evaluate expression */
+lisp_value lisp_eval(lisp_value env, lisp_value expr) {
+    /* GC Protection */
+    GC_PUSH_2(env, expr);
+    
+    lisp_value result = LISP_NIL;
+    
+    if (IS_SYMBOL(expr)) {
+        result = lisp_env_lookup(env, expr);
+    } else if (IS_CONS(expr)) {
+        lisp_value func_sym = CAR(expr);
+        lisp_value args = CDR(expr);
+        
+        /* Check for special forms */
+        if (IS_SYMBOL(func_sym)) {
+            lisp_value name = SYMBOL_NAME(func_sym);
+            struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
+            
+            if (strcmp(s->data, "quote") == 0) {
+                if (IS_CONS(args)) {
+                    result = CAR(args);
+                }
+                goto done;
+            } else if (strcmp(s->data, "if") == 0) {
+                lisp_value cond = CAR(args);
+                lisp_value then_branch = CAR(CDR(args));
+                lisp_value else_branch = LISP_NIL;
+                if (IS_CONS(CDR(CDR(args)))) {
+                    else_branch = CAR(CDR(CDR(args)));
+                }
+                
+                lisp_value cond_val = lisp_eval(env, cond);
+                GC_PUSH_1(cond_val);
+                
+                if (!IS_NIL(cond_val)) {
+                    result = lisp_eval(env, then_branch);
+                } else {
+                    result = lisp_eval(env, else_branch);
+                }
+                
+                GC_POP();
+                goto done;
+            } else if (strcmp(s->data, "lambda") == 0) {
+                lisp_value params = CAR(args);
+                lisp_value body = CDR(args);
+                result = lisp_create_function(body, env, params);
+                goto done;
+            } else if (strcmp(s->data, "defun") == 0) {
+                lisp_value name_sym = CAR(args);
+                lisp_value params = CAR(CDR(args));
+                lisp_value body = CDR(CDR(args));
+                
+                lisp_value func = lisp_create_function(body, env, params);
+                GC_PUSH_1(func);
+                
+                lisp_env_bind(env, name_sym, func);
+                
+                struct lisp_function* f = (struct lisp_function*)PTR_VAL(func);
+                f->name = name_sym;
+                gc_write_barrier(func, &f->name, name_sym);
+                
+                result = name_sym;
+                GC_POP();
+                goto done;
+            } else if (strcmp(s->data, "setq") == 0) {
+                lisp_value var = CAR(args);
+                lisp_value val_expr = CAR(CDR(args));
+                lisp_value val = lisp_eval(env, val_expr);
+                GC_PUSH_1(val);
+                lisp_env_set(env, var, val);
+                result = val;
+                GC_POP();
+                goto done;
+            }
+        }
+        
+        /* Function application */
+        lisp_value func = lisp_eval(env, func_sym);
+        GC_PUSH_1(func);
+        
+        /* Evaluate arguments */
+        lisp_value eval_args = LISP_NIL;
+        
+        if (IS_NIL(args)) {
+            eval_args = LISP_NIL;
+        } else {
+            lisp_value head = LISP_NIL;
+            lisp_value tail = LISP_NIL;
+            
+            lisp_value curr = args;
+            while (IS_CONS(curr)) {
+                lisp_value v = lisp_eval(env, CAR(curr));
+                GC_PUSH_1(v); 
+                
+                lisp_value new_cons = lisp_create_cons(v, LISP_NIL);
+                if (IS_NIL(head)) {
+                    head = new_cons;
+                    tail = new_cons;
+                } else {
+                    struct lisp_cons* c = (struct lisp_cons*)PTR_VAL(tail);
+                    c->cdr = new_cons;
+                    gc_write_barrier(tail, &c->cdr, new_cons);
+                    tail = new_cons;
+                }
+                
+                GC_POP(); 
+                curr = CDR(curr);
+            }
+            eval_args = head;
+        }
+        
+        GC_PUSH_1(eval_args);
+        
+        if (IS_FUNCTION(func)) {
+            result = lisp_apply(env, func, eval_args);
+        } else if (IS_SYMBOL(func_sym)) {
+             /* Builtin dispatch (same as before) */
+             lisp_value name = SYMBOL_NAME(func_sym);
+             struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
+             
+             if (strcmp(s->data, "car") == 0) result = builtin_car(env, eval_args);
+             else if (strcmp(s->data, "cdr") == 0) result = builtin_cdr(env, eval_args);
+             else if (strcmp(s->data, "cons") == 0) result = builtin_cons(env, eval_args);
+             else if (strcmp(s->data, "+") == 0) result = builtin_plus(env, eval_args);
+             else if (strcmp(s->data, "-") == 0) result = builtin_minus(env, eval_args);
+             else if (strcmp(s->data, "*") == 0) result = builtin_times(env, eval_args);
+             else if (strcmp(s->data, "/") == 0) result = builtin_divide(env, eval_args);
+             else if (strcmp(s->data, "print") == 0) result = builtin_print(env, eval_args);
+             else if (strcmp(s->data, "eq") == 0) result = builtin_eq(env, eval_args);
+             else if (strcmp(s->data, "atom") == 0) result = builtin_atom(env, eval_args);
+             else {
+                 printf("Error: Unknown function: ");
+                 lisp_print(func);
+                 printf("\n");
+             }
+        } else {
+            printf("Error: Invalid function call\n");
+        }
+        
+        GC_POP(); /* eval_args */
+        GC_POP(); /* func */
+        
+    } else {
+        /* Self-evaluating */
+        result = expr;
+    }
+    
+done:
+    GC_POP(); /* env, expr */
+    return result;
+}
+
+/* Built-in implementations (Same as before) */
+lisp_value builtin_car(lisp_value env, lisp_value args) {
+    if (IS_CONS(args)) {
+        lisp_value list = CAR(args);
+        if (IS_CONS(list)) return CAR(list);
+    }
+    return LISP_NIL;
+}
+
+lisp_value builtin_cdr(lisp_value env, lisp_value args) {
+    if (IS_CONS(args)) {
+        lisp_value list = CAR(args);
+        if (IS_CONS(list)) return CDR(list);
+    }
+    return LISP_NIL;
+}
+
+lisp_value builtin_cons(lisp_value env, lisp_value args) {
+    if (IS_CONS(args) && IS_CONS(CDR(args))) {
+        lisp_value car = CAR(args);
+        lisp_value cdr = CAR(CDR(args));
+        return lisp_create_cons(car, cdr);
+    }
+    return LISP_NIL;
+}
+
+lisp_value builtin_quote(lisp_value env, lisp_value args) {
+    if (IS_CONS(args)) return CAR(args);
+    return LISP_NIL;
+}
+
+lisp_value builtin_atom(lisp_value env, lisp_value args) {
+    if (IS_CONS(args)) {
+        lisp_value val = CAR(args);
+        return IS_CONS(val) ? LISP_NIL : LISP_T;
+    }
+    return LISP_T;
+}
+
+lisp_value builtin_eq(lisp_value env, lisp_value args) {
+    if (IS_CONS(args) && IS_CONS(CDR(args))) {
+        lisp_value a = CAR(args);
+        lisp_value b = CAR(CDR(args));
+        return (a == b) ? LISP_T : LISP_NIL;
+    }
+    return LISP_NIL;
+}
+
+lisp_value builtin_cond(lisp_value env, lisp_value args) {
+    return LISP_NIL;
+}
+
+lisp_value builtin_lambda(lisp_value env, lisp_value args) {
+    return LISP_NIL;
+}
+
+lisp_value builtin_defun(lisp_value env, lisp_value args) {
+    return LISP_NIL;
+}
+
+lisp_value builtin_setq(lisp_value env, lisp_value args) {
+    return LISP_NIL;
+}
+
+lisp_value builtin_plus(lisp_value env, lisp_value args) {
+    int64_t sum = 0;
+    while (IS_CONS(args)) {
+        lisp_value val = CAR(args);
+        if (IS_FIXNUM(val)) {
+            sum += FIXNUM_VAL(val);
+        }
+        args = CDR(args);
+    }
+    return MAKE_FIXNUM(sum);
+}
+
+lisp_value builtin_minus(lisp_value env, lisp_value args) {
+    if (!IS_CONS(args)) return MAKE_FIXNUM(0);
+    
+    lisp_value first = CAR(args);
+    int64_t val = IS_FIXNUM(first) ? FIXNUM_VAL(first) : 0;
+    
+    args = CDR(args);
+    if (IS_NIL(args)) {
+        return MAKE_FIXNUM(-val);
+    }
+    
+    while (IS_CONS(args)) {
+        lisp_value v = CAR(args);
+        if (IS_FIXNUM(v)) {
+            val -= FIXNUM_VAL(v);
+        }
+        args = CDR(args);
+    }
+    return MAKE_FIXNUM(val);
+}
+
+lisp_value builtin_times(lisp_value env, lisp_value args) {
+    int64_t prod = 1;
+    while (IS_CONS(args)) {
+        lisp_value val = CAR(args);
+        if (IS_FIXNUM(val)) {
+            prod *= FIXNUM_VAL(val);
+        }
+        args = CDR(args);
+    }
+    return MAKE_FIXNUM(prod);
+}
+
+lisp_value builtin_divide(lisp_value env, lisp_value args) {
+    if (!IS_CONS(args)) return MAKE_FIXNUM(1);
+    
+    lisp_value first = CAR(args);
+    int64_t val = IS_FIXNUM(first) ? FIXNUM_VAL(first) : 1;
+    
+    args = CDR(args);
+    while (IS_CONS(args)) {
+        lisp_value v = CAR(args);
+        if (IS_FIXNUM(v)) {
+            int64_t divisor = FIXNUM_VAL(v);
+            if (divisor != 0) val /= divisor;
+        }
+        args = CDR(args);
+    }
+    return MAKE_FIXNUM(val);
+}
+
+lisp_value builtin_print(lisp_value env, lisp_value args) {
+    while (IS_CONS(args)) {
+        lisp_print(CAR(args));
+        printf("\n");
+        args = CDR(args);
+    }
+    return LISP_NIL;
+}
+
+void lisp_register_builtin(const char* name, lisp_builtin_fn fn) {
+    /* Placeholder */
 }

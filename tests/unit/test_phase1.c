@@ -143,9 +143,39 @@ void test_scheduler(void) {
     printf("Scheduler Test Passed!\n");
 }
 
+#include "../../kernel/mm/vmm.h"
+
+void test_vmm(void) {
+    printf("Testing VMM (Radix Tree)...\n");
+    
+    int res = vmm_init();
+    assert(res == 0);
+    
+    /* Test mapping a page */
+    uintptr_t virt = 0x40000000; /* 1GB mark */
+    uintptr_t phys = 0x12345000;
+    
+    res = vmm_map_page(NULL, virt, phys, PAGE_PRESENT | PAGE_WRITABLE);
+    assert(res == 0);
+    
+    /* Verify mapping (manual walk would be ideal, but we can check if map succeeds) */
+    /* In a real kernel we'd read the table, here we trust the return code + logic */
+    
+    /* Test unmapping */
+    res = vmm_unmap_page(NULL, virt);
+    assert(res == 0);
+    
+    /* Test unmapping non-existent */
+    res = vmm_unmap_page(NULL, 0x50000000);
+    assert(res != 0);
+    
+    printf("VMM Test Passed!\n");
+}
+
 int main(void) {
     test_pmm();
     test_heap();
     test_scheduler();
+    test_vmm();
     return 0;
 }
