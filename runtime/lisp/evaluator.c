@@ -4,10 +4,13 @@
 #include "objects.h"
 #include "types.h"
 #include "hashtable.h"
+#include "symbols.h"
 #include "../gc/gc.h"
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
+#include <stdlib.h>
+#include "lisp_io.h"
+
 
 /* Global environment */
 static lisp_value global_env = LISP_NIL;
@@ -17,10 +20,18 @@ static inline bool is_env(lisp_value obj) {
     return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_ENV;
 }
 
+static inline bool is_builtin(lisp_value obj) {
+    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_BUILTIN;
+}
+
 #define IS_ENV(x) is_env(x)
+#define IS_BUILTIN(x) is_builtin(x)
 
 /* Initialize evaluator */
 int evaluator_init(void) {
+    /* Initialize Symbol System first */
+    if (symbols_init() != 0) return -1;
+    
     /* Create global environment */
     /* We need to register global_env as a root since it persists */
     gc_add_root(&global_env);
@@ -45,11 +56,17 @@ int evaluator_init(void) {
     lisp_register_builtin("print", builtin_print);
     
     /* Register T and NIL in global env */
-    lisp_env_bind(global_env, lisp_create_symbol("t"), LISP_T);
-    lisp_env_bind(global_env, lisp_create_symbol("nil"), LISP_NIL);
+    lisp_env_bind(global_env, lisp_intern("t"), LISP_T);
+    lisp_env_bind(global_env, lisp_intern("nil"), LISP_NIL);
     
     return 0;
 }
+
+/* Get global environment */
+lisp_value lisp_get_global_env(void) {
+    return global_env;
+}
+
 
 /* Create new environment */
 lisp_value lisp_env_create(lisp_value parent) {
@@ -63,8 +80,6 @@ lisp_value lisp_env_create(lisp_value parent) {
     
     lisp_value val = PTR_TO_VAL(env);
     gc_write_barrier(val, &env->parent, parent);
-    /* Note: table is not a Lisp object, so no write barrier needed for the pointer itself,
-       but its contents need tracing. */
        
     return val;
 }
@@ -77,37 +92,6 @@ void lisp_env_bind(lisp_value env, lisp_value symbol, lisp_value value) {
     if (!e->table) return;
     
     ht_put(e->table, symbol, value);
-    /* Write barrier? The table is internal. The GC needs to scan the table. 
-       Since we modified the table which is reachable from 'env', and 'value' is new,
-       we should technically trigger a barrier if 'env' is old and 'value' is young.
-       But 'table' is opaque to the write barrier function unless we expose it.
-       
-       For now, we rely on the fact that if 'env' is old, we might need to mark it dirty?
-       Or we just treat the table as part of the object.
-       
-       Actually, since 'table' is malloc'd separately (not gc_alloc'd), it's not in the heap.
-       So the write barrier logic for "Old Object -> Young Object" applies to 'env' -> 'value'.
-       But 'value' is inside 'table'.
-       
-       We should probably manually call write barrier for 'env' if we can't point to the specific slot.
-       Or, we can just assume the GC scans 'env' -> 'table' -> 'value'.
-       If 'env' is OLD, and we write a YOUNG 'value' into 'table', we need to record 'env' in remembered set.
-       
-       Let's conservatively call gc_write_barrier with a dummy slot or just add to remembered set directly?
-       gc_write_barrier(env, NULL, value) might work if we update it to handle NULL field.
-       
-       Let's just call it with &e->parent as a proxy, or better, expose a way to mark object dirty.
-       For now, I'll use a hack: pass &e->parent even though we aren't writing there, 
-       just to trigger the check "is env old? is value young?".
-       Wait, gc_write_barrier checks address of field to see if it's within the object? 
-       No, it usually just checks if obj is old and new_val is young.
-       
-       Let's check gc_write_barrier implementation in gc.c (I viewed it earlier).
-       It takes (obj, field, new_value). It doesn't seem to verify field is inside obj, 
-       but it might use it for card marking if we had card marking.
-       We have card marking? "mark_card_dirty(obj_ptr)".
-       So passing &e->parent is safe enough to mark the object dirty.
-    */
     gc_write_barrier(env, &e->parent, value);
 }
 
@@ -153,7 +137,6 @@ void lisp_env_set(lisp_value env, lisp_value symbol, lisp_value value) {
 
 /* Apply function */
 lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
-    /* GC Protection for inputs */
     GC_PUSH_3(env, func, args);
     
     lisp_value result = LISP_NIL;
@@ -164,11 +147,9 @@ lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
         lisp_value body = f->code;
         lisp_value closure_env = f->env;
         
-        /* Create new environment extending closure_env */
         lisp_value new_env = lisp_env_create(closure_env);
-        GC_PUSH_1(new_env); /* Protect new_env */
+        GC_PUSH_1(new_env); 
         
-        /* Bind arguments */
         lisp_value p = params;
         lisp_value a = args;
         
@@ -178,26 +159,27 @@ lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
             a = CDR(a);
         }
         
-        /* Evaluate body */
         while (IS_CONS(body)) {
             result = lisp_eval(new_env, CAR(body));
             body = CDR(body);
         }
         
-        GC_POP(); /* new_env */
+        GC_POP(); 
+    } else if (IS_BUILTIN(func)) {
+        struct lisp_builtin* b = (struct lisp_builtin*)PTR_VAL(func);
+        result = b->fn(env, args);
     } else {
         printf("Error: Not a function: ");
         lisp_print(func);
         printf("\n");
     }
     
-    GC_POP(); /* env, func, args */
+    GC_POP(); 
     return result;
 }
 
 /* Evaluate expression */
 lisp_value lisp_eval(lisp_value env, lisp_value expr) {
-    /* GC Protection */
     GC_PUSH_2(env, expr);
     
     lisp_value result = LISP_NIL;
@@ -208,11 +190,11 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
         lisp_value func_sym = CAR(expr);
         lisp_value args = CDR(expr);
         
-        /* Check for special forms */
         if (IS_SYMBOL(func_sym)) {
             lisp_value name = SYMBOL_NAME(func_sym);
             struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
             
+            /* Special forms must still be handled by name */
             if (strcmp(s->data, "quote") == 0) {
                 if (IS_CONS(args)) {
                     result = CAR(args);
@@ -259,6 +241,8 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                 result = name_sym;
                 GC_POP();
                 goto done;
+
+
             } else if (strcmp(s->data, "setq") == 0) {
                 lisp_value var = CAR(args);
                 lisp_value val_expr = CAR(CDR(args));
@@ -271,11 +255,9 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
             }
         }
         
-        /* Function application */
         lisp_value func = lisp_eval(env, func_sym);
         GC_PUSH_1(func);
         
-        /* Evaluate arguments */
         lisp_value eval_args = LISP_NIL;
         
         if (IS_NIL(args)) {
@@ -286,7 +268,10 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
             
             lisp_value curr = args;
             while (IS_CONS(curr)) {
+
+
                 lisp_value v = lisp_eval(env, CAR(curr));
+
                 GC_PUSH_1(v); 
                 
                 lisp_value new_cons = lisp_create_cons(v, LISP_NIL);
@@ -308,46 +293,29 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
         
         GC_PUSH_1(eval_args);
         
-        if (IS_FUNCTION(func)) {
+        if (IS_FUNCTION(func) || IS_BUILTIN(func)) {
             result = lisp_apply(env, func, eval_args);
-        } else if (IS_SYMBOL(func_sym)) {
-             /* Builtin dispatch (same as before) */
-             lisp_value name = SYMBOL_NAME(func_sym);
-             struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
-             
-             if (strcmp(s->data, "car") == 0) result = builtin_car(env, eval_args);
-             else if (strcmp(s->data, "cdr") == 0) result = builtin_cdr(env, eval_args);
-             else if (strcmp(s->data, "cons") == 0) result = builtin_cons(env, eval_args);
-             else if (strcmp(s->data, "+") == 0) result = builtin_plus(env, eval_args);
-             else if (strcmp(s->data, "-") == 0) result = builtin_minus(env, eval_args);
-             else if (strcmp(s->data, "*") == 0) result = builtin_times(env, eval_args);
-             else if (strcmp(s->data, "/") == 0) result = builtin_divide(env, eval_args);
-             else if (strcmp(s->data, "print") == 0) result = builtin_print(env, eval_args);
-             else if (strcmp(s->data, "eq") == 0) result = builtin_eq(env, eval_args);
-             else if (strcmp(s->data, "atom") == 0) result = builtin_atom(env, eval_args);
-             else {
-                 printf("Error: Unknown function: ");
-                 lisp_print(func);
-                 printf("\n");
-             }
         } else {
-            printf("Error: Invalid function call\n");
+            printf("Error: Invalid function call: ");
+            lisp_print(func_sym);
+            printf(" -> ");
+            lisp_print(func);
+            printf("\n");
         }
         
-        GC_POP(); /* eval_args */
-        GC_POP(); /* func */
+        GC_POP(); 
+        GC_POP(); 
         
     } else {
-        /* Self-evaluating */
         result = expr;
     }
     
 done:
-    GC_POP(); /* env, expr */
+    GC_POP(); 
     return result;
 }
 
-/* Built-in implementations (Same as before) */
+/* Built-in implementations */
 lisp_value builtin_car(lisp_value env, lisp_value args) {
     if (IS_CONS(args)) {
         lisp_value list = CAR(args);
@@ -412,6 +380,7 @@ lisp_value builtin_setq(lisp_value env, lisp_value args) {
 }
 
 lisp_value builtin_plus(lisp_value env, lisp_value args) {
+    // printf("DEBUG: builtin_plus called\n");
     int64_t sum = 0;
     while (IS_CONS(args)) {
         lisp_value val = CAR(args);
@@ -484,5 +453,21 @@ lisp_value builtin_print(lisp_value env, lisp_value args) {
 }
 
 void lisp_register_builtin(const char* name, lisp_builtin_fn fn) {
-    /* Placeholder */
+    struct lisp_builtin* b = (struct lisp_builtin*)gc_alloc(sizeof(struct lisp_builtin));
+    if (!b) return;
+    
+    SET_TYPE(&b->header, TYPE_BUILTIN);
+    b->fn = fn;
+    
+    lisp_value sym = lisp_intern(name);
+    GC_PUSH_1(sym);
+    
+    b->name = sym;
+    lisp_value val = PTR_TO_VAL(b);
+    
+    gc_write_barrier(val, &b->name, sym);
+    
+    lisp_env_bind(global_env, sym, val);
+    
+    GC_POP();
 }

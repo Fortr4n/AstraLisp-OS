@@ -22,7 +22,8 @@ typedef enum {
     TYPE_FUNCTION   = 5,
     TYPE_BIGNUM     = 6,
     TYPE_FLOAT      = 7,
-    TYPE_ENV        = 8
+    TYPE_ENV        = 8,
+    TYPE_BUILTIN    = 9
 } heap_type_t;
 
 /* Common Object Header */
@@ -94,6 +95,15 @@ struct lisp_env {
     struct lisp_header header;
     lisp_value parent;          /* Parent environment */
     struct hash_table* table;   /* Hash table for bindings */
+};
+
+/* Built-in Function */
+typedef lisp_value (*lisp_builtin_fn)(lisp_value env, lisp_value args);
+
+struct lisp_builtin {
+    struct lisp_header header;
+    lisp_builtin_fn fn;
+    lisp_value name;      /* Symbol or String name */
 };
 
 /* Accessor Macros */

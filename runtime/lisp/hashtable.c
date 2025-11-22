@@ -4,8 +4,10 @@
 #include "objects.h"
 #include "types.h"
 #include "../gc/gc.h"
+#include "../../kernel/mm/heap.h" /* For kmalloc/kfree */
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #define HT_INITIAL_CAPACITY 16
 #define HT_LOAD_FACTOR 0.75f
@@ -85,6 +87,7 @@ void ht_destroy(struct hash_table* ht) {
     if (!ht) return;
     
     for (uint32_t i = 0; i < ht->bucket_count; i++) {
+
         struct hash_entry* entry = ht->buckets[i];
         while (entry) {
             struct hash_entry* next = entry->next;
@@ -136,14 +139,6 @@ int ht_put(struct hash_table* ht, lisp_value key, lisp_value value) {
     while (entry) {
         if (entry->hash == hash && keys_equal(entry->key, key)) {
             entry->value = value;
-            /* Write barrier needed? 
-               This is a raw C hash table, not a Lisp object.
-               The GC scans roots. If 'ht' is reachable, we need to ensure 
-               its contents are marked.
-               
-               For now, we assume the owner of 'ht' (e.g. Environment object)
-               will have a custom marker function that iterates this table.
-            */
             return 0;
         }
         entry = entry->next;
@@ -163,7 +158,7 @@ int ht_put(struct hash_table* ht, lisp_value key, lisp_value value) {
 }
 
 lisp_value ht_get(struct hash_table* ht, lisp_value key) {
-    if (!ht) return LISP_NIL; // Or unbound?
+    if (!ht) return LISP_NIL; 
     
     uint32_t hash = hash_value(key);
     uint32_t idx = hash & (ht->bucket_count - 1);
@@ -193,4 +188,27 @@ bool ht_contains(struct hash_table* ht, lisp_value key) {
         entry = entry->next;
     }
     return false;
+}
+
+void ht_remove(struct hash_table* ht, lisp_value key) {
+    if (!ht) return;
+    
+    uint32_t hash = hash_value(key);
+    uint32_t idx = hash & (ht->bucket_count - 1);
+    
+    struct hash_entry* entry = ht->buckets[idx];
+    struct hash_entry* prev = NULL;
+    
+    while (entry) {
+        if (entry->hash == hash && keys_equal(entry->key, key)) {
+            if (prev) prev->next = entry->next;
+            else ht->buckets[idx] = entry->next;
+            
+            kfree(entry);
+            ht->entry_count--;
+            return;
+        }
+        prev = entry;
+        entry = entry->next;
+    }
 }

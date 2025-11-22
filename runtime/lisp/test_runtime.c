@@ -28,20 +28,21 @@ void test_expression(const char* input, const char* expected_output) {
     /* Protect expr from GC */
     GC_PUSH_1(expr);
     
-    lisp_value env = lisp_env_create(LISP_NIL);
-    GC_PUSH_1(env);
-    
-    /* Register basic symbols like T and NIL in this env if not global */
-    lisp_env_bind(env, lisp_create_symbol("t"), LISP_T);
-    lisp_env_bind(env, lisp_create_symbol("nil"), LISP_NIL);
+    /* Use global environment */
+    lisp_value env = lisp_get_global_env();
+    /* No need to push env as it is a root */
+
     
     lisp_value result = lisp_eval(env, expr);
     
     printf("Result: ");
     lisp_print(result);
     printf("\n");
+
+
     
-    GC_POP(); /* env */
+    /* GC_POP(); env is root */
+
     GC_POP(); /* expr */
     
     /* Trigger GC to check for crashes */
@@ -49,6 +50,7 @@ void test_expression(const char* input, const char* expected_output) {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0); /* Disable buffering */
     printf("Initializing AstraLisp Runtime...\n");
     
     if (gc_init() != 0) {
@@ -86,6 +88,8 @@ int main() {
     /* Test 6: Define and Use */
     test_expression("(defun add2 (x) (+ x 2))", "add2");
     test_expression("(add2 5)", "7");
+
+
     
     printf("All tests completed.\n");
     

@@ -48,17 +48,22 @@ LDFLAGS := -m64 -nostdlib -static -T linker.ld
 
 # Include directories
 INCLUDES := -I$(KERNEL_DIR) -I$(KERNEL_DIR)/hal -I$(KERNEL_DIR)/mm \
-            -I$(KERNEL_DIR)/process -I$(KERNEL_DIR)/interrupt -I$(KERNEL_DIR)/driver
+            -I$(KERNEL_DIR)/process -I$(KERNEL_DIR)/interrupt -I$(KERNEL_DIR)/driver \
+            -I$(RUNTIME_DIR)/lisp -I$(RUNTIME_DIR)/gc
+
 
 # Source files
 KERNEL_SOURCES := $(shell find $(KERNEL_DIR) -name "*.c" -o -name "*.cpp" 2>/dev/null)
 KERNEL_ASM := $(shell find $(KERNEL_DIR) -name "*.asm" -o -name "*.S" 2>/dev/null)
+RUNTIME_SOURCES := $(shell find $(RUNTIME_DIR) -name "*.c" 2>/dev/null)
 BOOTLOADER_SOURCES := $(shell find $(BOOTLOADER_DIR) -name "*.c" -o -name "*.cpp" 2>/dev/null)
 BOOTLOADER_ASM := $(shell find $(BOOTLOADER_DIR) -name "*.asm" -o -name "*.S" 2>/dev/null)
 
 # Object files
 KERNEL_OBJECTS := $(KERNEL_SOURCES:%.c=$(BUILD_DIR)/%.o) $(KERNEL_SOURCES:%.cpp=$(BUILD_DIR)/%.o) \
-                 $(KERNEL_ASM:%.asm=$(BUILD_DIR)/%.o) $(KERNEL_ASM:%.S=$(BUILD_DIR)/%.o)
+                 $(KERNEL_ASM:%.asm=$(BUILD_DIR)/%.o) $(KERNEL_ASM:%.S=$(BUILD_DIR)/%.o) \
+                 $(RUNTIME_SOURCES:%.c=$(BUILD_DIR)/%.o)
+
 BOOTLOADER_OBJECTS := $(BOOTLOADER_SOURCES:%.c=$(BUILD_DIR)/%.o) \
                      $(BOOTLOADER_SOURCES:%.cpp=$(BUILD_DIR)/%.o) \
                      $(BOOTLOADER_ASM:%.asm=$(BUILD_DIR)/%.o) \

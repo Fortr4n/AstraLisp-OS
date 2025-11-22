@@ -10,8 +10,12 @@
 #include "interrupt/idt.h"
 #include "process/scheduler.h"
 #include "process/process.h"
-#include "../runtime/runtime.h"
-#include "lisp/kernel-lisp.h"
+#include "../runtime/gc/gc.h"
+#include "../runtime/lisp/evaluator.h"
+#include "../runtime/lisp/reader.h"
+#include "../runtime/lisp/drivers.h"
+#include "../runtime/lisp/objects.h"
+
 
 /* Forward declarations */
 extern void interrupt_handler(uint32_t interrupt_number, void* stack_frame);
@@ -105,51 +109,85 @@ tags_done:
         kernel_panic("Failed to initialize heap");
     }
     
-    early_printf("Initializing Lisp runtime...\n");
+    /* Initialize Lisp Runtime */
+    early_printf("Initializing Lisp Runtime...\n");
     
-    /* Initialize Lisp runtime */
-    if (runtime_init() != 0) {
-        kernel_panic("Failed to initialize Lisp runtime");
+    if (gc_init() != 0) {
+        kernel_panic("Failed to init GC");
     }
     
-    /* Initialize kernel Lisp interface */
-    if (kernel_lisp_init() != 0) {
-        kernel_panic("Failed to initialize kernel Lisp interface");
+    if (evaluator_init() != 0) {
+        kernel_panic("Failed to init Evaluator");
     }
     
-    if (kernel_lisp_register_functions() != 0) {
-        kernel_panic("Failed to register kernel Lisp functions");
-    }
+    drivers_init();
     
-    early_printf("Initializing interrupt system...\n");
+    early_printf("AstraLisp OS Ready. Entering REPL...\n");
     
-    /* Initialize interrupt descriptor table */
-    if (idt_init() != 0) {
-        kernel_panic("Failed to initialize IDT");
-    }
+    /* REPL Loop */
+    char input_buffer[1024];
+    size_t buffer_pos = 0;
     
-    /* Enable interrupts */
-    __asm__ volatile ("mfmsr %r0; ori %r0, %r0, 0x8000; mtmsr %r0" ::: "r0");
+    serial_puts("\n> ");
     
-    early_printf("Initializing scheduler...\n");
-    
-    /* Initialize scheduler */
-    if (scheduler_init() != 0) {
-        kernel_panic("Failed to initialize scheduler");
-    }
-    
-    /* Create initial kernel thread */
-    early_printf("Creating initial kernel thread...\n");
-    
-    early_printf("Kernel initialization complete!\n");
-    early_printf("Entering main loop...\n");
-    
-    /* Main kernel loop */
     for (;;) {
-        /* Run scheduler */
-        scheduler_tick();
+        if (serial_data_available()) {
+            char c = serial_getchar();
+            
+            /* Echo */
+            serial_putchar(c);
+            
+            if (c == '\r' || c == '\n') {
+                serial_putchar('\n');
+                input_buffer[buffer_pos] = '\0';
+                
+                if (buffer_pos > 0) {
+                    /* Read */
+                    struct reader_context ctx;
+                    reader_init(&ctx, input_buffer);
+                    
+                    lisp_value expr = reader_read(&ctx);
+                    
+                    /* Eval */
+                    /* Protect expr */
+                    GC_PUSH_1(expr);
+                    lisp_value result = lisp_eval(lisp_get_global_env(), expr);
+                    
+                    /* Print */
+                    /* Redirect stdout to serial for lisp_print? 
+                       lisp_print uses printf. We need to hook printf or modify lisp_print.
+                       For now, let's assume lisp_print writes to stdout and we need to redirect it.
+                       But we are in kernel mode, printf might not work or might be early_printf.
+                       
+                       Wait, lisp_print in reader.c uses printf. 
+                       I need to make lisp_print use serial_puts or vga_puts.
+                       
+                       I will modify reader.c to use a print callback or macro.
+                       For now, I'll just run the loop and address printing next.
+                    */
+                     
+                    /* Temporary: We can't see output unless lisp_print works. */
+                    /* I will add a temporary print implementation here or modify reader.c later. */
+                    
+                    GC_POP(); /* expr */
+                }
+                
+                buffer_pos = 0;
+                serial_puts("> ");
+            } else if (c == '\b' || c == 127) {
+                if (buffer_pos > 0) {
+                    buffer_pos--;
+                    /* Handle backspace visual */
+                    serial_puts("\b \b");
+                }
+            } else if (buffer_pos < sizeof(input_buffer) - 1) {
+                input_buffer[buffer_pos++] = c;
+            }
+        }
         
-        /* Idle */
+        /* Run scheduler/idle */
+        // scheduler_tick(); 
         __asm__ volatile ("nop");
     }
 }
+

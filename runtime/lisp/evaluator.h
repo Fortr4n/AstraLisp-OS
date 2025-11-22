@@ -12,7 +12,11 @@
 /* Initialize evaluator */
 int evaluator_init(void);
 
+/* Get global environment */
+lisp_value lisp_get_global_env(void);
+
 /* Create new environment */
+
 lisp_value lisp_env_create(lisp_value parent);
 
 /* Bind variable in environment */

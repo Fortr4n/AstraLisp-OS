@@ -1,37 +1,66 @@
-/* AstraLisp OS Lisp Reader */
+/* AstraLisp OS Reader Implementation */
 
 #include "reader.h"
-#include "tagged.h"
 #include "objects.h"
 #include "types.h"
+#include "symbols.h"
 #include "../gc/gc.h"
-#include <ctype.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdlib.h>
-#include <stdio.h>
+#include "lisp_io.h"
 
-/* Helper: Peek next character */
-static char peek(struct reader_context* ctx) {
-    if (ctx->pos >= ctx->len) return 0;
-    return ctx->input[ctx->pos];
+#ifdef KERNEL
+    #include "../../kernel/hal/serial.h"
+#endif
+
+/* Helper: Print integer */
+static void print_int(int64_t n) {
+    char buffer[32];
+    int i = 0;
+    int sign = 0;
+    
+    if (n == 0) {
+        LISP_PUTS("0");
+        return;
+    }
+
+    
+    if (n < 0) {
+        sign = 1;
+        n = -n;
+    }
+    
+    while (n > 0) {
+        buffer[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+    
+    if (sign) buffer[i++] = '-';
+    
+    while (i > 0) {
+        LISP_PUTCHAR(buffer[--i]);
+    }
 }
 
-/* Helper: Advance position */
-static char advance(struct reader_context* ctx) {
-    if (ctx->pos >= ctx->len) return 0;
-    return ctx->input[ctx->pos++];
-}
+
 
 /* Helper: Skip whitespace */
 static void skip_whitespace(struct reader_context* ctx) {
     while (ctx->pos < ctx->len) {
-        char c = peek(ctx);
+        char c = ctx->input[ctx->pos];
         if (isspace(c)) {
-            advance(ctx);
+            if (c == '\n') {
+                ctx->line++;
+                ctx->column = 0;
+            } else {
+                ctx->column++;
+            }
+            ctx->pos++;
         } else if (c == ';') {
             /* Comment: skip to end of line */
-            while (ctx->pos < ctx->len && peek(ctx) != '\n') {
-                advance(ctx);
+            while (ctx->pos < ctx->len && ctx->input[ctx->pos] != '\n') {
+                ctx->pos++;
             }
         } else {
             break;
@@ -39,143 +68,40 @@ static void skip_whitespace(struct reader_context* ctx) {
     }
 }
 
-/* Initialize reader context */
+/* Helper: Peek character */
+static char peek(struct reader_context* ctx) {
+    if (ctx->pos >= ctx->len) return 0;
+    return ctx->input[ctx->pos];
+}
+
+/* Helper: Read character */
+static char next(struct reader_context* ctx) {
+    if (ctx->pos >= ctx->len) return 0;
+    char c = ctx->input[ctx->pos++];
+    if (c == '\n') {
+        ctx->line++;
+        ctx->column = 0;
+    } else {
+        ctx->column++;
+    }
+    return c;
+}
+
+/* Initialize reader */
 void reader_init(struct reader_context* ctx, const char* input) {
     ctx->input = input;
     ctx->pos = 0;
     ctx->len = strlen(input);
     ctx->line = 1;
-    ctx->column = 1;
+    ctx->column = 0;
     ctx->symbols = LISP_NIL;
 }
 
-/* Read integer */
-static lisp_value read_integer(struct reader_context* ctx) {
-    char buf[64];
-    int i = 0;
-    
-    if (peek(ctx) == '-') {
-        buf[i++] = advance(ctx);
-    }
-    
-    while (isdigit(peek(ctx))) {
-        if (i < 63) buf[i++] = advance(ctx);
-        else advance(ctx);
-    }
-    buf[i] = 0;
-    
-    int64_t val = atoll(buf);
-    return MAKE_FIXNUM(val);
-}
-
-/* Read symbol */
-static lisp_value read_symbol(struct reader_context* ctx) {
-    char buf[256];
-    int i = 0;
-    
-    while (ctx->pos < ctx->len) {
-        char c = peek(ctx);
-        if (isspace(c) || c == '(' || c == ')' || c == ';') {
-            break;
-        }
-        if (i < 255) buf[i++] = advance(ctx);
-        else advance(ctx);
-    }
-    buf[i] = 0;
-    
-    /* Check for NIL and T */
-    if (strcasecmp(buf, "nil") == 0) return LISP_NIL;
-    if (strcasecmp(buf, "t") == 0) return LISP_T;
-    
-    return lisp_create_symbol(buf);
-}
-
-/* Read list */
-static lisp_value read_list(struct reader_context* ctx) {
-    advance(ctx); /* Skip '(' */
-    skip_whitespace(ctx);
-    
-    if (peek(ctx) == ')') {
-        advance(ctx);
-        return LISP_NIL;
-    }
-    
-    lisp_value head = LISP_NIL;
-    lisp_value tail = LISP_NIL;
-    
-    /* Protect head and tail during reading */
-    GC_PUSH_2(head, tail);
-    
-    while (ctx->pos < ctx->len && peek(ctx) != ')') {
-        lisp_value val = reader_read(ctx);
-        
-        /* Check for dot notation */
-        /* Note: This simple reader doesn't handle dot notation perfectly yet */
-        /* If val is the dot symbol, read next as cdr and finish */
-        /* For now, standard list reading */
-        
-        lisp_value new_cons = lisp_create_cons(val, LISP_NIL);
-        
-        if (IS_NIL(head)) {
-            head = new_cons;
-            tail = new_cons;
-        } else {
-            struct lisp_cons* c = (struct lisp_cons*)PTR_VAL(tail);
-            c->cdr = new_cons;
-            gc_write_barrier(tail, &c->cdr, new_cons);
-            tail = new_cons;
-        }
-        
-        skip_whitespace(ctx);
-    }
-    
-    if (peek(ctx) == ')') {
-        advance(ctx);
-    }
-    
-    GC_POP(); /* head, tail */
-    return head;
-}
-
-/* Read quote */
-static lisp_value read_quote(struct reader_context* ctx) {
-    advance(ctx); /* Skip '\'' */
-    lisp_value expr = reader_read(ctx);
-    
-    /* Return (quote expr) */
-    GC_PUSH_1(expr);
-    lisp_value q = lisp_create_symbol("quote");
-    lisp_value list = lisp_create_cons(expr, LISP_NIL);
-    lisp_value result = lisp_create_cons(q, list);
-    GC_POP();
-    return result;
-}
-
-/* Main read function */
-lisp_value reader_read(struct reader_context* ctx) {
-    skip_whitespace(ctx);
-    
-    char c = peek(ctx);
-    if (c == 0) return LISP_NIL; /* EOF */
-    
-    if (c == '(') {
-        return read_list(ctx);
-    } else if (c == '\'') {
-        return read_quote(ctx);
-    } else if (isdigit(c) || (c == '-' && isdigit(ctx->input[ctx->pos+1]))) {
-        return read_integer(ctx);
-    } else {
-        return read_symbol(ctx);
-    }
-}
-
-/* Factory functions */
-
+/* Factory: Create Cons */
 lisp_value lisp_create_cons(lisp_value car, lisp_value cdr) {
     struct lisp_cons* cons = (struct lisp_cons*)gc_alloc(sizeof(struct lisp_cons));
     if (!cons) return LISP_NIL;
     
-    /* Set header type */
     SET_TYPE(&cons->header, TYPE_CONS);
     
     cons->car = car;
@@ -190,44 +116,41 @@ lisp_value lisp_create_cons(lisp_value car, lisp_value cdr) {
     return val;
 }
 
+/* Factory: Create Symbol (Uses Interning) */
 lisp_value lisp_create_symbol(const char* name) {
-    /* Interning logic should go here. For now, just create new symbol. */
-    /* In a real system, we'd check a symbol table. */
-    
-    /* Create string for name */
-    size_t len = strlen(name);
-    struct lisp_string* str = (struct lisp_string*)gc_alloc(sizeof(struct lisp_string) + len + 1);
+    return lisp_intern(name);
+}
+
+/* Factory: Create String */
+lisp_value lisp_create_string(const char* data, size_t length) {
+    struct lisp_string* str = (struct lisp_string*)gc_alloc(sizeof(struct lisp_string) + length + 1);
     if (!str) return LISP_NIL;
     
     SET_TYPE(&str->header, TYPE_STRING);
+    str->length = length;
+    memcpy(str->data, data, length);
+    str->data[length] = '\0';
     
-    str->length = len;
-    strcpy(str->data, name);
-    
-    lisp_value name_val = PTR_TO_VAL(str);
-    GC_PUSH_1(name_val);
-    
-    /* Create symbol */
-    struct lisp_symbol* sym = (struct lisp_symbol*)gc_alloc(sizeof(struct lisp_symbol));
-    if (!sym) {
-        GC_POP();
-        return LISP_NIL;
-    }
-    
-    SET_TYPE(&sym->header, TYPE_SYMBOL);
-    
-    sym->name = name_val;
-    sym->value = LISP_NIL; /* Unbound */
-    sym->function = LISP_NIL;
-    sym->hash = 0; /* Todo: hash function */
-    
-    lisp_value sym_val = PTR_TO_VAL(sym);
-    gc_write_barrier(sym_val, &sym->name, name_val);
-    
-    GC_POP();
-    return sym_val;
+    return PTR_TO_VAL(str);
 }
 
+/* Factory: Create Vector */
+lisp_value lisp_create_vector(size_t length) {
+    struct lisp_vector* vec = (struct lisp_vector*)gc_alloc(sizeof(struct lisp_vector) + length * sizeof(lisp_value));
+    if (!vec) return LISP_NIL;
+    
+    SET_TYPE(&vec->header, TYPE_VECTOR);
+    vec->length = length;
+    
+    /* Initialize with NIL */
+    for (size_t i = 0; i < length; i++) {
+        vec->data[i] = LISP_NIL;
+    }
+    
+    return PTR_TO_VAL(vec);
+}
+
+/* Factory: Create Function */
 lisp_value lisp_create_function(lisp_value code, lisp_value env, lisp_value args) {
     struct lisp_function* func = (struct lisp_function*)gc_alloc(sizeof(struct lisp_function));
     if (!func) return LISP_NIL;
@@ -247,46 +170,169 @@ lisp_value lisp_create_function(lisp_value code, lisp_value env, lisp_value args
     return val;
 }
 
-/* Placeholder for other factories */
-lisp_value lisp_create_string(const char* data, size_t length) {
-    return LISP_NIL; // Todo
+/* Parse List */
+static lisp_value read_list(struct reader_context* ctx) {
+    next(ctx); /* Skip '(' */
+    skip_whitespace(ctx);
+    
+    if (peek(ctx) == ')') {
+        next(ctx);
+        return LISP_NIL;
+    }
+    
+    lisp_value head = LISP_NIL;
+    lisp_value tail = LISP_NIL;
+    
+    GC_PUSH_2(head, tail);
+    
+    while (ctx->pos < ctx->len && peek(ctx) != ')') {
+
+
+
+        if (peek(ctx) == '.') {
+            /* Dotted list */
+            next(ctx); /* Skip '.' */
+            skip_whitespace(ctx);
+            lisp_value last = reader_read(ctx);
+            
+            if (!IS_NIL(tail)) {
+                struct lisp_cons* c = (struct lisp_cons*)PTR_VAL(tail);
+                c->cdr = last;
+                gc_write_barrier(tail, &c->cdr, last);
+            } else {
+                head = last; /* Should not happen for proper dotted list (a . b) */
+            }
+            
+            skip_whitespace(ctx);
+            if (peek(ctx) == ')') next(ctx);
+            goto done;
+        }
+        
+        lisp_value val = reader_read(ctx);
+        GC_PUSH_1(val);
+        
+        lisp_value new_cons = lisp_create_cons(val, LISP_NIL);
+        
+        if (IS_NIL(head)) {
+            head = new_cons;
+            tail = new_cons;
+        } else {
+            struct lisp_cons* c = (struct lisp_cons*)PTR_VAL(tail);
+            c->cdr = new_cons;
+            gc_write_barrier(tail, &c->cdr, new_cons);
+            tail = new_cons;
+        }
+        
+        GC_POP(); /* val */
+        skip_whitespace(ctx);
+    }
+    
+    if (peek(ctx) == ')') next(ctx);
+    
+done:
+    GC_POP(); /* head, tail */
+    return head;
 }
 
-lisp_value lisp_create_vector(size_t length) {
-    return LISP_NIL; // Todo
+/* Parse Symbol or Number */
+static lisp_value read_atom(struct reader_context* ctx) {
+    char buffer[256];
+    int idx = 0;
+    
+    while (ctx->pos < ctx->len) {
+        char c = peek(ctx);
+        if (isspace(c) || c == ')' || c == '(') break;
+        
+        if (idx < 255) buffer[idx++] = next(ctx);
+        else next(ctx);
+    }
+    buffer[idx] = '\0';
+    
+    /* Check if number */
+    char* end;
+    long long num = strtoll(buffer, &end, 10);
+    if (*end == '\0') {
+        return MAKE_FIXNUM(num);
+    }
+    
+    return lisp_create_symbol(buffer);
 }
 
-void lisp_print(lisp_value val) {
-    if (IS_NIL(val)) {
-        printf("NIL");
-    } else if (IS_T(val)) {
-        printf("T");
-    } else if (IS_FIXNUM(val)) {
-        printf("%lld", FIXNUM_VAL(val));
-    } else if (IS_CONS(val)) {
-        printf("(");
-        lisp_print(CAR(val));
-        lisp_value curr = CDR(val);
+/* Read object */
+lisp_value reader_read(struct reader_context* ctx) {
+    skip_whitespace(ctx);
+
+
+    
+    char c = peek(ctx);
+    if (c == '(') {
+        return read_list(ctx);
+    } else if (c == '\'') {
+        next(ctx);
+        lisp_value expr = reader_read(ctx);
+        GC_PUSH_1(expr);
+        lisp_value quote_sym = lisp_create_symbol("quote");
+        GC_PUSH_1(quote_sym);
+        
+        lisp_value list = lisp_create_cons(expr, LISP_NIL);
+        GC_PUSH_1(list);
+        lisp_value result = lisp_create_cons(quote_sym, list);
+        
+        GC_POP(); /* list */
+        GC_POP(); /* quote_sym */
+        GC_POP(); /* expr */
+        return result;
+    } else if (c == 0) {
+        return LISP_NIL; /* EOF */
+    } else {
+        return read_atom(ctx);
+    }
+}
+
+
+/* Print object */
+/* Print object */
+void lisp_print(lisp_value obj) {
+    if (IS_FIXNUM(obj)) {
+
+
+        print_int(FIXNUM_VAL(obj));
+    } else if (IS_NIL(obj)) {
+        LISP_PUTS("nil");
+    } else if (IS_T(obj)) {
+        LISP_PUTS("t");
+    } else if (IS_CONS(obj)) {
+        LISP_PUTS("(");
+        lisp_print(CAR(obj));
+        lisp_value curr = CDR(obj);
         while (IS_CONS(curr)) {
-            printf(" ");
+            LISP_PUTS(" ");
             lisp_print(CAR(curr));
             curr = CDR(curr);
         }
         if (!IS_NIL(curr)) {
-            printf(" . ");
+            LISP_PUTS(" . ");
             lisp_print(curr);
         }
-        printf(")");
-    } else if (IS_SYMBOL(val)) {
-        lisp_value name = SYMBOL_NAME(val);
+        LISP_PUTS(")");
+    } else if (IS_SYMBOL(obj)) {
+        lisp_value name = SYMBOL_NAME(obj);
         struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
-        printf("%s", s->data);
-    } else if (IS_STRING(val)) {
-        struct lisp_string* s = (struct lisp_string*)PTR_VAL(val);
-        printf("\"%s\"", s->data);
-    } else if (IS_FUNCTION(val)) {
-        printf("#<FUNCTION>");
+        LISP_PUTS(s->data);
+    } else if (IS_STRING(obj)) {
+        struct lisp_string* s = (struct lisp_string*)PTR_VAL(obj);
+        LISP_PUTS("\"");
+        LISP_PUTS(s->data);
+        LISP_PUTS("\"");
+    } else if (IS_FUNCTION(obj)) {
+        LISP_PUTS("<function>");
+    } else if (GET_TYPE(PTR_VAL(obj)) == TYPE_BUILTIN) {
+        LISP_PUTS("<builtin>");
+    } else if (GET_TYPE(PTR_VAL(obj)) == TYPE_ENV) {
+        LISP_PUTS("<env>");
     } else {
-        printf("#<UNKNOWN>");
+        LISP_PUTS("?");
     }
 }
+
+

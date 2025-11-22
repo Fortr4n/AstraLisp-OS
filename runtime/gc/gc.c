@@ -3,11 +3,14 @@
 #include "gc.h"
 #include "../lisp/objects.h"
 #include "../lisp/types.h"
+#include "../lisp/hashtable.h"
 #include "../../kernel/mm/heap.h"
 #include "../../kernel/mm/pmm.h"
 #include <stddef.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
+
 
 #define GC_MARK_BIT 0x1
 #define GC_WEAK_BIT 0x2
@@ -56,6 +59,7 @@ struct gc_context {
     struct gc_generation young_gen;
     struct gc_generation old_gen;
     struct gc_root* roots;              /* Global roots */
+    struct hash_table* symbol_table;    /* Registered symbol table */
     struct gc_stack_frame* stack_top;   /* Shadow stack top */
     uint32_t collection_threshold;
     bool collecting;
@@ -249,9 +253,34 @@ static void mark_object(lisp_value obj) {
             mark_object(func->name);
             break;
         }
+        case TYPE_ENV: {
+            struct lisp_env* env = (struct lisp_env*)ptr;
+            mark_object(env->parent);
+            if (env->table) {
+                /* Iterate hash table */
+                for (uint32_t i = 0; i < env->table->bucket_count; i++) {
+                    struct hash_entry* entry = env->table->buckets[i];
+                    while (entry) {
+                        mark_object(entry->key);
+                        mark_object(entry->value);
+                        entry = entry->next;
+                    }
+
+
+                }
+            }
+            break;
+
+        }
+        case TYPE_BUILTIN: {
+            struct lisp_builtin* b = (struct lisp_builtin*)ptr;
+            mark_object(b->name);
+            break;
+        }
         default: break;
     }
 }
+
 
 static void mark_roots(void) {
     if (!gc_ctx) return;
@@ -265,6 +294,9 @@ static void mark_roots(void) {
         root = root->next;
     }
 
+
+
+
     /* Mark shadow stack roots */
     struct gc_stack_frame* frame = gc_ctx->stack_top;
     while (frame) {
@@ -275,12 +307,31 @@ static void mark_roots(void) {
         }
         frame = frame->prev;
     }
+    
+    /* Mark symbol table */
+    if (gc_ctx->symbol_table) {
+        struct hash_table* table = gc_ctx->symbol_table;
+        for (uint32_t i = 0; i < table->bucket_count; i++) {
+            struct hash_entry* entry = table->buckets[i];
+            while (entry) {
+                mark_object(entry->key);
+                mark_object(entry->value);
+                entry = entry->next;
+            }
+        }
+    }
 }
+
+
+
+/* ========== Sweeping ========== */
 
 /* ========== Sweeping ========== */
 
 static size_t sweep_generation(struct gc_generation* gen) {
     if (!gen) return 0;
+
+
     
     size_t freed = 0;
     struct gc_object_header* obj = gen->objects;
@@ -296,6 +347,15 @@ static size_t sweep_generation(struct gc_generation* gen) {
             
             freed += obj->size;
             gen->allocated_size -= obj->size;
+            
+            void* ptr = get_object(obj);
+            if (GET_TYPE(ptr) == TYPE_ENV) {
+                struct lisp_env* env = (struct lisp_env*)ptr;
+                if (env->table) ht_destroy(env->table);
+            }
+
+
+            
             kfree(obj);
         } else {
             /* Keep & Unmark */
@@ -331,10 +391,14 @@ static void collect_young(void) {
     if (!gc_ctx) return;
     gc_ctx->collecting = true;
 
+
+
     mark_roots();
     scan_remembered_set();
     size_t freed = sweep_generation(&gc_ctx->young_gen);
     remembered_set_clear();
+
+
 
     gc_ctx->young_gen.collection_count++;
     gc_ctx->stats.total_freed += freed;
@@ -441,6 +505,12 @@ void gc_remove_root(lisp_value* pointer) {
         }
         prev = root;
         root = root->next;
+    }
+}
+
+void gc_register_symbol_table(struct hash_table* table) {
+    if (gc_ctx) {
+        gc_ctx->symbol_table = table;
     }
 }
 
