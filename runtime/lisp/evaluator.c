@@ -8,9 +8,8 @@
 #include "../gc/gc.h"
 #include <string.h>
 #include <stdlib.h>
-#include <stdlib.h>
 #include "lisp_io.h"
-
+#include "error.h"
 
 /* Global environment */
 static lisp_value global_env = LISP_NIL;
@@ -54,6 +53,7 @@ int evaluator_init(void) {
     lisp_register_builtin("*", builtin_times);
     lisp_register_builtin("/", builtin_divide);
     lisp_register_builtin("print", builtin_print);
+    lisp_register_builtin("error", builtin_error);
     
     /* Register T and NIL in global env */
     lisp_env_bind(global_env, lisp_intern("t"), LISP_T);
@@ -66,7 +66,6 @@ int evaluator_init(void) {
 lisp_value lisp_get_global_env(void) {
     return global_env;
 }
-
 
 /* Create new environment */
 lisp_value lisp_env_create(lisp_value parent) {
@@ -92,6 +91,7 @@ void lisp_env_bind(lisp_value env, lisp_value symbol, lisp_value value) {
     if (!e->table) return;
     
     ht_put(e->table, symbol, value);
+    printf("Debug: Bound symbol "); lisp_print(symbol); printf(" in env %p\n", e);
     gc_write_barrier(env, &e->parent, value);
 }
 
@@ -101,6 +101,7 @@ lisp_value lisp_env_lookup(lisp_value env, lisp_value symbol) {
         struct lisp_env* e = (struct lisp_env*)PTR_VAL(env);
         
         if (e->table && ht_contains(e->table, symbol)) {
+            printf("Debug: Found symbol "); lisp_print(symbol); printf(" in env %p\n", e);
             return ht_get(e->table, symbol);
         }
         
@@ -108,10 +109,7 @@ lisp_value lisp_env_lookup(lisp_value env, lisp_value symbol) {
     }
     
     /* Not found */
-    printf("Error: Unbound variable: ");
-    lisp_print(symbol);
-    printf("\n");
-    return LISP_NIL;
+    return LISP_UNBOUND;
 }
 
 /* Set variable in environment */
@@ -130,9 +128,7 @@ void lisp_env_set(lisp_value env, lisp_value symbol, lisp_value value) {
     }
     
     /* Not found */
-    printf("Error: Cannot set unbound variable: ");
-    lisp_print(symbol);
-    printf("\n");
+    lisp_error("Cannot set unbound variable");
 }
 
 /* Apply function */
@@ -148,16 +144,19 @@ lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
         lisp_value closure_env = f->env;
         
         lisp_value new_env = lisp_env_create(closure_env);
+        printf("Debug: Created new_env %llx parent %llx\n", new_env, closure_env);
         GC_PUSH_1(new_env); 
         
         lisp_value p = params;
         lisp_value a = args;
         
         while (IS_CONS(p) && IS_CONS(a)) {
+            printf("Debug: Binding param "); lisp_print(CAR(p)); printf(" to "); lisp_print(CAR(a)); printf("\n");
             lisp_env_bind(new_env, CAR(p), CAR(a));
             p = CDR(p);
             a = CDR(a);
         }
+
         
         while (IS_CONS(body)) {
             result = lisp_eval(new_env, CAR(body));
@@ -169,9 +168,7 @@ lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
         struct lisp_builtin* b = (struct lisp_builtin*)PTR_VAL(func);
         result = b->fn(env, args);
     } else {
-        printf("Error: Not a function: ");
-        lisp_print(func);
-        printf("\n");
+        lisp_error("Not a function");
     }
     
     GC_POP(); 
@@ -186,6 +183,9 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
     
     if (IS_SYMBOL(expr)) {
         result = lisp_env_lookup(env, expr);
+        if (result == LISP_UNBOUND) {
+             lisp_error("Unbound variable");
+        }
     } else if (IS_CONS(expr)) {
         lisp_value func_sym = CAR(expr);
         lisp_value args = CDR(expr);
@@ -193,8 +193,10 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
         if (IS_SYMBOL(func_sym)) {
             lisp_value name = SYMBOL_NAME(func_sym);
             struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
+            printf("Debug: Checking special form: %s\n", s->data);
             
             /* Special forms must still be handled by name */
+
             if (strcmp(s->data, "quote") == 0) {
                 if (IS_CONS(args)) {
                     result = CAR(args);
@@ -230,9 +232,12 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                 lisp_value body = CDR(CDR(args));
                 
                 lisp_value func = lisp_create_function(body, env, params);
+                if (IS_NIL(func)) printf("Debug: defun failed to create function\n");
+                else printf("Debug: defun created function %llx\n", func);
                 GC_PUSH_1(func);
                 
                 lisp_env_bind(env, name_sym, func);
+
                 
                 struct lisp_function* f = (struct lisp_function*)PTR_VAL(func);
                 f->name = name_sym;
@@ -241,8 +246,6 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                 result = name_sym;
                 GC_POP();
                 goto done;
-
-
             } else if (strcmp(s->data, "setq") == 0) {
                 lisp_value var = CAR(args);
                 lisp_value val_expr = CAR(CDR(args));
@@ -252,11 +255,43 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                 result = val;
                 GC_POP();
                 goto done;
+            } else if (strcmp(s->data, "try") == 0) {
+                /* (try expr handler) */
+                lisp_value expr = CAR(args);
+                lisp_value handler = CAR(CDR(args));
+                
+                struct error_handler eh;
+                lisp_push_handler(&eh);
+                
+                if (setjmp(eh.buf) == 0) {
+                    /* Normal execution */
+                    result = lisp_eval(env, expr);
+                    lisp_pop_handler();
+                } else {
+                    /* Error occurred */
+                    lisp_pop_handler();
+                    
+                    /* Call handler with error message */
+                    const char* msg_str = lisp_last_error_msg ? lisp_last_error_msg : "Unknown Error";
+                    lisp_value msg = lisp_create_string(msg_str, strlen(msg_str));
+                    GC_PUSH_1(msg);
+                    
+                    lisp_value handler_args = lisp_create_cons(msg, LISP_NIL);
+                    GC_PUSH_1(handler_args);
+                    
+                    result = lisp_apply(env, handler, handler_args);
+                    
+                    GC_POP(); /* handler_args */
+                    GC_POP(); /* msg */
+                }
+                goto done;
             }
         }
         
         lisp_value func = lisp_eval(env, func_sym);
+        printf("Debug: Evaluated function symbol "); lisp_print(func_sym); printf(" -> %llx (type %d)\n", func, IS_POINTER(func) ? GET_TYPE(PTR_VAL(func)) : -1);
         GC_PUSH_1(func);
+
         
         lisp_value eval_args = LISP_NIL;
         
@@ -268,10 +303,7 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
             
             lisp_value curr = args;
             while (IS_CONS(curr)) {
-
-
                 lisp_value v = lisp_eval(env, CAR(curr));
-
                 GC_PUSH_1(v); 
                 
                 lisp_value new_cons = lisp_create_cons(v, LISP_NIL);
@@ -296,11 +328,7 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
         if (IS_FUNCTION(func) || IS_BUILTIN(func)) {
             result = lisp_apply(env, func, eval_args);
         } else {
-            printf("Error: Invalid function call: ");
-            lisp_print(func_sym);
-            printf(" -> ");
-            lisp_print(func);
-            printf("\n");
+            lisp_error("Invalid function call");
         }
         
         GC_POP(); 
@@ -380,7 +408,6 @@ lisp_value builtin_setq(lisp_value env, lisp_value args) {
 }
 
 lisp_value builtin_plus(lisp_value env, lisp_value args) {
-    // printf("DEBUG: builtin_plus called\n");
     int64_t sum = 0;
     while (IS_CONS(args)) {
         lisp_value val = CAR(args);
@@ -451,6 +478,22 @@ lisp_value builtin_print(lisp_value env, lisp_value args) {
     }
     return LISP_NIL;
 }
+
+lisp_value builtin_error(lisp_value env, lisp_value args) {
+    if (IS_CONS(args)) {
+        lisp_value msg_val = CAR(args);
+        if (IS_POINTER(msg_val) && GET_TYPE(PTR_VAL(msg_val)) == TYPE_STRING) {
+            struct lisp_string* s = (struct lisp_string*)PTR_VAL(msg_val);
+            lisp_error(s->data);
+        } else {
+            lisp_error("Error called with non-string argument");
+        }
+    } else {
+        lisp_error("Error called with no arguments");
+    }
+    return LISP_NIL;
+}
+
 
 void lisp_register_builtin(const char* name, lisp_builtin_fn fn) {
     struct lisp_builtin* b = (struct lisp_builtin*)gc_alloc(sizeof(struct lisp_builtin));

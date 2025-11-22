@@ -65,7 +65,10 @@ lisp_value lisp_intern(const char* name) {
     sym->name = name_val;
     sym->value = LISP_NIL;
     sym->function = LISP_NIL;
+    sym->plist = LISP_NIL;
+    sym->package = LISP_NIL;
     sym->hash = 0; /* Todo: store hash */
+
     
     lisp_value sym_val = PTR_TO_VAL(sym);
     gc_write_barrier(sym_val, &sym->name, name_val);

@@ -209,8 +209,6 @@ void gc_write_barrier(lisp_value obj, lisp_value* field, lisp_value new_value) {
     }
 }
 
-/* ========== Marking ========== */
-
 static void mark_object(lisp_value obj) {
     if (!gc_ctx || !IS_POINTER(obj)) return;
     
@@ -220,6 +218,8 @@ static void mark_object(lisp_value obj) {
     
     if (header->flags & GC_MARK_BIT) return;
     header->flags |= GC_MARK_BIT;
+    
+    // printf("GC: marking object %p type %d\n", header, GET_TYPE(ptr));
     
     heap_type_t type = GET_TYPE(ptr);
     switch (type) {
@@ -265,12 +265,9 @@ static void mark_object(lisp_value obj) {
                         mark_object(entry->value);
                         entry = entry->next;
                     }
-
-
                 }
             }
             break;
-
         }
         case TYPE_BUILTIN: {
             struct lisp_builtin* b = (struct lisp_builtin*)ptr;
@@ -281,7 +278,6 @@ static void mark_object(lisp_value obj) {
     }
 }
 
-
 static void mark_roots(void) {
     if (!gc_ctx) return;
     
@@ -289,13 +285,11 @@ static void mark_roots(void) {
     struct gc_root* root = gc_ctx->roots;
     while (root) {
         if (root->pointer) {
+            // printf("GC: marking root %p\n", root->pointer);
             mark_object(*root->pointer);
         }
         root = root->next;
     }
-
-
-
 
     /* Mark shadow stack roots */
     struct gc_stack_frame* frame = gc_ctx->stack_top;
@@ -322,16 +316,10 @@ static void mark_roots(void) {
     }
 }
 
-
-
-/* ========== Sweeping ========== */
-
 /* ========== Sweeping ========== */
 
 static size_t sweep_generation(struct gc_generation* gen) {
     if (!gen) return 0;
-
-
     
     size_t freed = 0;
     struct gc_object_header* obj = gen->objects;
@@ -353,8 +341,6 @@ static size_t sweep_generation(struct gc_generation* gen) {
                 struct lisp_env* env = (struct lisp_env*)ptr;
                 if (env->table) ht_destroy(env->table);
             }
-
-
             
             kfree(obj);
         } else {
@@ -389,16 +375,13 @@ static size_t sweep_generation(struct gc_generation* gen) {
 
 static void collect_young(void) {
     if (!gc_ctx) return;
+    // printf("GC: collect_young start\n");
     gc_ctx->collecting = true;
-
-
 
     mark_roots();
     scan_remembered_set();
     size_t freed = sweep_generation(&gc_ctx->young_gen);
     remembered_set_clear();
-
-
 
     gc_ctx->young_gen.collection_count++;
     gc_ctx->stats.total_freed += freed;

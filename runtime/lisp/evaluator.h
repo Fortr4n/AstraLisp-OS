@@ -54,5 +54,7 @@ lisp_value builtin_minus(lisp_value env, lisp_value args);
 lisp_value builtin_times(lisp_value env, lisp_value args);
 lisp_value builtin_divide(lisp_value env, lisp_value args);
 lisp_value builtin_print(lisp_value env, lisp_value args);
+lisp_value builtin_error(lisp_value env, lisp_value args);
+
 
 #endif /* EVALUATOR_H */
