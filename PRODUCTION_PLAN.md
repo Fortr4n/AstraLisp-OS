@@ -27,12 +27,56 @@ This document provides a comprehensive, implementation-focused plan to bring Ast
 
 ### Architecture Requirements
 
+- **Target Architecture**: PowerISA v3.1C (POWER10/OpenPOWER)
+- **Endianness**: Little-Endian (ppc64le)
+- **Boot Protocol**: Skiboot / OPAL / Multiboot2 (PowerPC)
+- **Prefix Instructions**: Support new 64-bit Prefix Instructions (v3.1)
 - **Real Algorithms**: Use proven, production-grade algorithms
 - **Proper Data Structures**: Efficient, scalable data structures
 - **Memory Safety**: No memory leaks, use-after-free, or buffer overflows
 - **Concurrency**: Proper locking, no race conditions, deadlock prevention
 - **Scalability**: Handle large numbers of processes, files, connections
 - **Reliability**: Graceful degradation, recovery from errors
+
+---
+
+## Phase 0: Low-Level Runtime & Assembly Bridge (Immediate Priority)
+
+**Goal**: Establish the foundational assembly layer for PowerISA and the FFI bridge between C/Lisp and hardware.
+
+### 0.1 Kernel Entry & Boot
+
+- **Files**: `kernel/arch/ppc64/start.S`, `kernel/arch/ppc64/boot.c`
+- **Requirements**:
+  - [ ] Implement Multiboot2 header for PowerPC.
+  - [ ] Set up initial stack and TOC (Table of Contents) pointer.
+  - [ ] Validate processor state (MSR) and switch to supervisor mode.
+  - [ ] Call `early_init` and jump to `kernel_main`.
+
+### 0.2 Exception Vector Table
+
+- **Files**: `kernel/arch/ppc64/vectors.S`, `kernel/arch/ppc64/traps.c`
+- **Requirements**:
+  - [ ] Implement Exception Vector definitions (0x300, 0x400, etc.) at physical address 0x0.
+  - [ ] Implement context save/restore (GPRs, FRPs, VRs, VSRs, CR, LR, CTR, XER).
+  - [ ] Dispatch to C exception handlers (`handle_exception(...)`).
+
+### 0.3 FFI Trampolines
+
+- **Files**: `kernel/arch/ppc64/ffi.S`
+- **Requirements**:
+  - [ ] Implement `ffi_read_spr` / `ffi_write_spr`.
+  - [ ] Implement `ffi_cpu_halt` (nap/doze) and `ffi_cpu_pause`.
+  - [ ] Implement `ffi_test_altivec` / `ffi_test_vsx` with proper exception handling logic.
+  - [ ] Implement atomic operations (lwarx/stwcx).
+
+### 0.4 OPAL / Open Firmware Console
+
+- **Files**: `kernel/drivers/opal-console.c`, `kernel/drivers/of-console.c`
+- **Note**: Replace x86 `serial.c` and `vga.c`.
+- **Requirements**:
+  - [ ] Implement OPAL calls for serial output (`opal_console_write`).
+  - [ ] Implement Open Firmware client interface for early text output.
 
 ---
 
@@ -122,15 +166,15 @@ struct pmm_state {
 
 #### Requirements
 
-- **Page Table Management**: Full 4-level page table implementation (PowerISA)
-- **Page Mapping**: Map/unmap pages with proper flags
-- **Page Fault Handling**: Complete page fault handler with COW, demand paging
-- **Address Space Management**: Create/destroy address spaces
-- **TLB Management**: Invalidate TLB entries properly
-- **Memory Protection**: Read, write, execute permissions
+- **Page Table Management**: PowerISA v3.1 Radix Tree (preferred) or Hash Page Table (legacy)
+- **Page Mapping**: Map/unmap pages with proper permissions (R/W/X/Imprecise)
+- **Page Fault Handling**: Handle DSI (Data Storage) and ISI (Instruction Storage) interrupts
+- **Address Space Management**: Manage Process ID (PID) and Logical PID (LPID)
+- **TLB Management**: Implement `tlbie` broadcasting and `tlbiel` local invalidation
+- **Memory Protection**: Execute permissions (No-Execute bit)
 - **Copy-on-Write**: Implement COW for fork()
 - **Demand Paging**: Lazy allocation of pages
-- **Memory Sharing**: Shared memory regions
+- **Memory Sharing**: Shared memory regions via VSID sharing
 
 #### Implementation Details
 
@@ -619,12 +663,14 @@ struct scheduler_state {
 
 #### Requirements
 
-- **Interrupt Handler Registration**: Register handlers for all interrupt types
-- **Nested Interrupts**: Support nested interrupt handling
-- **Interrupt Priorities**: Handle interrupt priorities
-- **Timer Interrupts**: System timer, scheduler tick
-- **Device Interrupts**: Handle device interrupts
-- **Exception Handling**: Handle CPU exceptions
+- **Interrupt Controller**: Support XICS (Legacy) and XIVE2 (POWER10)
+- **Interrupt Handler Registration**: Register handlers for External, Timer, and Doorbell interrupts
+- **Nested Interrupts**: Support separate IRQ Stacks per CPU
+- **Interrupt Priorities**: Hardware priority management (CPPR)
+- **Timer Interrupts**: Decrementer (DEC) and Hypervisor Decrementer (HDEC)
+- **Device Interrupts**: Map Message Signaled Interrupts (MSI/MSI-X) to LISNs
+- **Exception Handling**: Machine Check, System Reset, Data/Instruction Storage
+- **Interrupt Statistics**: Per-IRQ and per-CPU statistics
 - **Interrupt Statistics**: Track interrupt statistics
 
 #### Implementation Details
@@ -704,6 +750,7 @@ This is the first phase. The plan continues with detailed specifications for all
 
 #### Requirements
 
+- **Discovery**: Locate AHCI controller via Device Tree (open-pic/pci nodes)
 - **Port Detection**: Detect all AHCI ports and their capabilities
 - **Port Initialization**: Initialize ports, set up command lists, FIS structures
 - **Command Processing**: Process read/write commands with proper DMA
@@ -6740,242 +6787,241 @@ This roadmap provides a comprehensive path to a production-grade Operating Syste
 
 This section defines the ABI for all kernel system calls.
 
-| ID  | Name | Signature | Description |
-| --- | ---- | --------- | ----------- |
-| 0   | `sys_exit` | `void exit(int status)` | Terminate the calling process. |
-| 1   | `sys_fork` | `pid_t fork(void)` | Create a child process. |
-| 2   | `sys_read` | `ssize_t read(int fd, void *buf, size_t count)` | Read from a file descriptor. |
-| 3   | `sys_write` | `ssize_t write(int fd, const void *buf, size_t count)` | Write to a file descriptor. |
-| 4   | `sys_open` | `int open(const char *pathname, int flags, mode_t mode)` | Open a file. |
-| 5   | `sys_close` | `int close(int fd)` | Close a file descriptor. |
-| 6   | `sys_waitpid` | `pid_t waitpid(pid_t pid, int *status, int options)` | Wait for process change. |
-| 7   | `sys_creat` | `int creat(const char *pathname, mode_t mode)` | Create a file. |
-| 8   | `sys_link` | `int link(const char *oldpath, const char *newpath)` | Make a new name for a file. |
-| 9   | `sys_unlink` | `int unlink(const char *pathname)` | Delete a name and possibly the file. |
-| 10  | `sys_execve` | `int execve(const char *filename, char *const argv[], char *const envp[])` | Execute program. |
-| 11  | `sys_chdir` | `int chdir(const char *path)` | Change working directory. |
-| 12  | `sys_time` | `time_t time(time_t *tloc)` | Get time in seconds. |
-| 13  | `sys_mknod` | `int mknod(const char *pathname, mode_t mode, dev_t dev)` | Create directory/special file. |
-| 14  | `sys_chmod` | `int chmod(const char *pathname, mode_t mode)` | Change permissions of a file. |
-| 15  | `sys_lchown` | `int lchown(const char *pathname, uid_t owner, gid_t group)` | Change ownership of a file. |
-| 16  | `sys_stat` | `int stat(const char *pathname, struct stat *statbuf)` | Get file status. |
-| 17  | `sys_lseek` | `off_t lseek(int fd, off_t offset, int whence)` | Reposition read/write offset. |
-| 18  | `sys_getpid` | `pid_t getpid(void)` | Get process identity. |
-| 19  | `sys_mount` | `int mount(const char *source, const char *target, const char *filesystemtype, unsigned long mountflags, const void *data)` | Mount filesystem. |
-| 20  | `sys_umount` | `int umount(const char *target)` | Unmount filesystem. |
-| 21  | `sys_setuid` | `int setuid(uid_t uid)` | Set user identity. |
-| 22  | `sys_getuid` | `uid_t getuid(void)` | Get user identity. |
-| 23  | `sys_stime` | `int stime(const time_t *t)` | Set system time. |
-| 24  | `sys_ptrace` | `long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data)` | Process trace. |
-| 25  | `sys_alarm` | `unsigned int alarm(unsigned int seconds)` | Schedule an alarm signal. |
-| 26  | `sys_fstat` | `int fstat(int fd, struct stat *statbuf)` | Get file status (fd). |
-| 27  | `sys_pause` | `int pause(void)` | Wait for signal. |
-| 28  | `sys_utime` | `int utime(const char *filename, const struct utimbuf *times)` | Change file last access/mod times. |
-| 29  | `sys_access` | `int access(const char *pathname, int mode)` | Check user's permissions for a file. |
-| 30  | `sys_nice` | `int nice(int inc)` | Change process priority. |
-| 31  | `sys_sync` | `void sync(void)` | Commit buffer cache to disk. |
-| 32  | `sys_kill` | `int kill(pid_t pid, int sig)` | Send signal to a process. |
-| 33  | `sys_rename` | `int rename(const char *oldpath, const char *newpath)` | Change location/name of a file. |
-| 34  | `sys_mkdir` | `int mkdir(const char *pathname, mode_t mode)` | Create a directory. |
-| 35  | `sys_rmdir` | `int rmdir(const char *pathname)` | Delete a directory. |
-| 36  | `sys_dup` | `int dup(int oldfd)` | Duplicate a file descriptor. |
-| 37  | `sys_pipe` | `int pipe(int pipefd[2])` | Create pipe. |
-| 38  | `sys_times` | `clock_t times(struct tms *buf)` | Get process times. |
-| 39  | `sys_brk` | `int brk(void *addr)` | Change data segment size. |
-| 40  | `sys_setgid` | `int setgid(gid_t gid)` | Set group identity. |
-| 41  | `sys_getgid` | `gid_t getgid(void)` | Get group identity. |
-| 42  | `sys_signal` | `sighandler_t signal(int signum, sighandler_t handler)` | ANSI C signal handling. |
-| 43  | `sys_geteuid` | `uid_t geteuid(void)` | Get effective user identity. |
-| 44  | `sys_getegid` | `gid_t getegid(void)` | Get effective group identity. |
-| 45  | `sys_acct` | `int acct(const char *filename)` | Switch process accounting on/off. |
-| 46  | `sys_ioctl` | `int ioctl(int fd, unsigned long request, ...)` | Control device. |
-| 47  | `sys_fcntl` | `int fcntl(int fd, int cmd, ...)` | Manipulate file descriptor. |
-| 48  | `sys_setpgid` | `int setpgid(pid_t pid, pid_t pgid)` | Set process group ID. |
-| 49  | `sys_umask` | `mode_t umask(mode_t mask)` | Set file mode creation mask. |
-| 50  | `sys_chroot` | `int chroot(const char *path)` | Change root directory. |
-| 51  | `sys_ustat` | `int ustat(dev_t dev, struct ustat *ubuf)` | Get filesystem statistics. |
-| 52  | `sys_dup2` | `int dup2(int oldfd, int newfd)` | Duplicate a file descriptor. |
-| 53  | `sys_getppid` | `pid_t getppid(void)` | Get parent process ID. |
-| 54  | `sys_getpgrp` | `pid_t getpgrp(void)` | Get process group ID. |
-| 55  | `sys_setsid` | `pid_t setsid(void)` | Create session and set process group ID. |
-| 56  | `sys_sigaction` | `int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)` | Examine and change signal action. |
-| 57  | `sys_sgetmask` | `int sgetmask(void)` | Get signal mask (obsolete). |
-| 58  | `sys_ssetmask` | `int ssetmask(int newmask)` | Set signal mask (obsolete). |
-| 59  | `sys_setreuid` | `int setreuid(uid_t ruid, uid_t euid)` | Set real and/or effective user ID. |
-| 60  | `sys_setregid` | `int setregid(gid_t rgid, gid_t egid)` | Set real and/or effective group ID. |
-| 61  | `sys_sigsuspend` | `int sigsuspend(const sigset_t *mask)` | Wait for a signal. |
-| 62  | `sys_sigpending` | `int sigpending(sigset_t *set)` | Examine pending signals. |
-| 63  | `sys_sethostname` | `int sethostname(const char *name, size_t len)` | Set hostname. |
-| 64  | `sys_setrlimit` | `int setrlimit(int resource, const struct rlimit *rlim)` | Set resource limits. |
-| 65  | `sys_getrlimit` | `int getrlimit(int resource, struct rlimit *rlim)` | Get resource limits. |
-| 66  | `sys_getrusage` | `int getrusage(int who, struct rusage *usage)` | Get resource usage. |
-| 67  | `sys_gettimeofday` | `int gettimeofday(struct timeval *tv, struct timezone *tz)` | Get time. |
-| 68  | `sys_settimeofday` | `int settimeofday(const struct timeval *tv, const struct timezone *tz)` | Set time. |
-| 69  | `sys_getgroups` | `int getgroups(int size, gid_t list[])` | Get supplementary group IDs. |
-| 70  | `sys_setgroups` | `int setgroups(size_t size, const gid_t *list)` | Set supplementary group IDs. |
-| 71  | `sys_select` | `int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)` | Synchronous I/O multiplexing. |
-| 72  | `sys_symlink` | `int symlink(const char *target, const char *linkpath)` | Make a new name for a file. |
-| 73  | `sys_lstat` | `int lstat(const char *pathname, struct stat *statbuf)` | Get file status. |
-| 74  | `sys_readlink` | `ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)` | Read value of a symbolic link. |
-| 75  | `sys_uselib` | `int uselib(const char *library)` | Select shared library. |
-| 76  | `sys_swapon` | `int swapon(const char *path, int swapflags)` | Start/stop swapping to file/device. |
-| 77  | `sys_reboot` | `int reboot(int magic, int magic2, int cmd, void *arg)` | Reboot or enable/disable Ctrl-Alt-Del. |
-| 78  | `sys_readdir` | `int readdir(unsigned int fd, struct old_linux_dirent *dirp, unsigned int count)` | Read directory entry. |
-| 79  | `sys_mmap` | `void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)` | Map files or devices into memory. |
-| 80  | `sys_munmap` | `int munmap(void *addr, size_t length)` | Unmap files or devices. |
-| 81  | `sys_truncate` | `int truncate(const char *path, off_t length)` | Truncate a file to a specified length. |
-| 82  | `sys_ftruncate` | `int ftruncate(int fd, off_t length)` | Truncate a file to a specified length. |
-| 83  | `sys_fchmod` | `int fchmod(int fd, mode_t mode)` | Change permissions of a file. |
-| 84  | `sys_fchown` | `int fchown(int fd, uid_t owner, gid_t group)` | Change ownership of a file. |
-| 85  | `sys_getpriority` | `int getpriority(int which, id_t who)` | Get program scheduling priority. |
-| 86  | `sys_setpriority` | `int setpriority(int which, id_t who, int prio)` | Set program scheduling priority. |
-| 87  | `sys_statfs` | `int statfs(const char *path, struct statfs *buf)` | Get filesystem statistics. |
-| 88  | `sys_fstatfs` | `int fstatfs(int fd, struct statfs *buf)` | Get filesystem statistics. |
-| 89  | `sys_ioperm` | `int ioperm(unsigned long from, unsigned long num, int turn_on)` | Set port input/output permissions. |
-| 90  | `sys_socketcall` | `int socketcall(int call, unsigned long *args)` | Socket system calls (multiplexer). |
-| 91  | `sys_syslog` | `int syslog(int type, char *bufp, int len)` | Read and/or clear kernel message ring buffer. |
-| 92  | `sys_setitimer` | `int setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value)` | Set value of an interval timer. |
-| 93  | `sys_getitimer` | `int getitimer(int which, struct itimerval *curr_value)` | Get value of an interval timer. |
-| 94  | `sys_newstat` | `int newstat(const char *pathname, struct stat *statbuf)` | Get file status. |
-| 95  | `sys_newlstat` | `int newlstat(const char *pathname, struct stat *statbuf)` | Get file status. |
-| 96  | `sys_newfstat` | `int newfstat(int fd, struct stat *statbuf)` | Get file status. |
-| 97  | `sys_uname` | `int uname(struct utsname *buf)` | Get name and information about current kernel. |
-| 98  | `sys_iopl` | `int iopl(int level)` | Change I/O privilege level. |
-| 99  | `sys_vhangup` | `int vhangup(void)` | Virtually hangup the current terminal. |
+| ID  | Name               | Signature                                                                                                                   | Description                                    |
+| --- | ------------------ | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| 0   | `sys_exit`         | `void exit(int status)`                                                                                                     | Terminate the calling process.                 |
+| 1   | `sys_fork`         | `pid_t fork(void)`                                                                                                          | Create a child process.                        |
+| 2   | `sys_read`         | `ssize_t read(int fd, void *buf, size_t count)`                                                                             | Read from a file descriptor.                   |
+| 3   | `sys_write`        | `ssize_t write(int fd, const void *buf, size_t count)`                                                                      | Write to a file descriptor.                    |
+| 4   | `sys_open`         | `int open(const char *pathname, int flags, mode_t mode)`                                                                    | Open a file.                                   |
+| 5   | `sys_close`        | `int close(int fd)`                                                                                                         | Close a file descriptor.                       |
+| 6   | `sys_waitpid`      | `pid_t waitpid(pid_t pid, int *status, int options)`                                                                        | Wait for process change.                       |
+| 7   | `sys_creat`        | `int creat(const char *pathname, mode_t mode)`                                                                              | Create a file.                                 |
+| 8   | `sys_link`         | `int link(const char *oldpath, const char *newpath)`                                                                        | Make a new name for a file.                    |
+| 9   | `sys_unlink`       | `int unlink(const char *pathname)`                                                                                          | Delete a name and possibly the file.           |
+| 10  | `sys_execve`       | `int execve(const char *filename, char *const argv[], char *const envp[])`                                                  | Execute program.                               |
+| 11  | `sys_chdir`        | `int chdir(const char *path)`                                                                                               | Change working directory.                      |
+| 12  | `sys_time`         | `time_t time(time_t *tloc)`                                                                                                 | Get time in seconds.                           |
+| 13  | `sys_mknod`        | `int mknod(const char *pathname, mode_t mode, dev_t dev)`                                                                   | Create directory/special file.                 |
+| 14  | `sys_chmod`        | `int chmod(const char *pathname, mode_t mode)`                                                                              | Change permissions of a file.                  |
+| 15  | `sys_lchown`       | `int lchown(const char *pathname, uid_t owner, gid_t group)`                                                                | Change ownership of a file.                    |
+| 16  | `sys_stat`         | `int stat(const char *pathname, struct stat *statbuf)`                                                                      | Get file status.                               |
+| 17  | `sys_lseek`        | `off_t lseek(int fd, off_t offset, int whence)`                                                                             | Reposition read/write offset.                  |
+| 18  | `sys_getpid`       | `pid_t getpid(void)`                                                                                                        | Get process identity.                          |
+| 19  | `sys_mount`        | `int mount(const char *source, const char *target, const char *filesystemtype, unsigned long mountflags, const void *data)` | Mount filesystem.                              |
+| 20  | `sys_umount`       | `int umount(const char *target)`                                                                                            | Unmount filesystem.                            |
+| 21  | `sys_setuid`       | `int setuid(uid_t uid)`                                                                                                     | Set user identity.                             |
+| 22  | `sys_getuid`       | `uid_t getuid(void)`                                                                                                        | Get user identity.                             |
+| 23  | `sys_stime`        | `int stime(const time_t *t)`                                                                                                | Set system time.                               |
+| 24  | `sys_ptrace`       | `long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data)`                                             | Process trace.                                 |
+| 25  | `sys_alarm`        | `unsigned int alarm(unsigned int seconds)`                                                                                  | Schedule an alarm signal.                      |
+| 26  | `sys_fstat`        | `int fstat(int fd, struct stat *statbuf)`                                                                                   | Get file status (fd).                          |
+| 27  | `sys_pause`        | `int pause(void)`                                                                                                           | Wait for signal.                               |
+| 28  | `sys_utime`        | `int utime(const char *filename, const struct utimbuf *times)`                                                              | Change file last access/mod times.             |
+| 29  | `sys_access`       | `int access(const char *pathname, int mode)`                                                                                | Check user's permissions for a file.           |
+| 30  | `sys_nice`         | `int nice(int inc)`                                                                                                         | Change process priority.                       |
+| 31  | `sys_sync`         | `void sync(void)`                                                                                                           | Commit buffer cache to disk.                   |
+| 32  | `sys_kill`         | `int kill(pid_t pid, int sig)`                                                                                              | Send signal to a process.                      |
+| 33  | `sys_rename`       | `int rename(const char *oldpath, const char *newpath)`                                                                      | Change location/name of a file.                |
+| 34  | `sys_mkdir`        | `int mkdir(const char *pathname, mode_t mode)`                                                                              | Create a directory.                            |
+| 35  | `sys_rmdir`        | `int rmdir(const char *pathname)`                                                                                           | Delete a directory.                            |
+| 36  | `sys_dup`          | `int dup(int oldfd)`                                                                                                        | Duplicate a file descriptor.                   |
+| 37  | `sys_pipe`         | `int pipe(int pipefd[2])`                                                                                                   | Create pipe.                                   |
+| 38  | `sys_times`        | `clock_t times(struct tms *buf)`                                                                                            | Get process times.                             |
+| 39  | `sys_brk`          | `int brk(void *addr)`                                                                                                       | Change data segment size.                      |
+| 40  | `sys_setgid`       | `int setgid(gid_t gid)`                                                                                                     | Set group identity.                            |
+| 41  | `sys_getgid`       | `gid_t getgid(void)`                                                                                                        | Get group identity.                            |
+| 42  | `sys_signal`       | `sighandler_t signal(int signum, sighandler_t handler)`                                                                     | ANSI C signal handling.                        |
+| 43  | `sys_geteuid`      | `uid_t geteuid(void)`                                                                                                       | Get effective user identity.                   |
+| 44  | `sys_getegid`      | `gid_t getegid(void)`                                                                                                       | Get effective group identity.                  |
+| 45  | `sys_acct`         | `int acct(const char *filename)`                                                                                            | Switch process accounting on/off.              |
+| 46  | `sys_ioctl`        | `int ioctl(int fd, unsigned long request, ...)`                                                                             | Control device.                                |
+| 47  | `sys_fcntl`        | `int fcntl(int fd, int cmd, ...)`                                                                                           | Manipulate file descriptor.                    |
+| 48  | `sys_setpgid`      | `int setpgid(pid_t pid, pid_t pgid)`                                                                                        | Set process group ID.                          |
+| 49  | `sys_umask`        | `mode_t umask(mode_t mask)`                                                                                                 | Set file mode creation mask.                   |
+| 50  | `sys_chroot`       | `int chroot(const char *path)`                                                                                              | Change root directory.                         |
+| 51  | `sys_ustat`        | `int ustat(dev_t dev, struct ustat *ubuf)`                                                                                  | Get filesystem statistics.                     |
+| 52  | `sys_dup2`         | `int dup2(int oldfd, int newfd)`                                                                                            | Duplicate a file descriptor.                   |
+| 53  | `sys_getppid`      | `pid_t getppid(void)`                                                                                                       | Get parent process ID.                         |
+| 54  | `sys_getpgrp`      | `pid_t getpgrp(void)`                                                                                                       | Get process group ID.                          |
+| 55  | `sys_setsid`       | `pid_t setsid(void)`                                                                                                        | Create session and set process group ID.       |
+| 56  | `sys_sigaction`    | `int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)`                                          | Examine and change signal action.              |
+| 57  | `sys_sgetmask`     | `int sgetmask(void)`                                                                                                        | Get signal mask (obsolete).                    |
+| 58  | `sys_ssetmask`     | `int ssetmask(int newmask)`                                                                                                 | Set signal mask (obsolete).                    |
+| 59  | `sys_setreuid`     | `int setreuid(uid_t ruid, uid_t euid)`                                                                                      | Set real and/or effective user ID.             |
+| 60  | `sys_setregid`     | `int setregid(gid_t rgid, gid_t egid)`                                                                                      | Set real and/or effective group ID.            |
+| 61  | `sys_sigsuspend`   | `int sigsuspend(const sigset_t *mask)`                                                                                      | Wait for a signal.                             |
+| 62  | `sys_sigpending`   | `int sigpending(sigset_t *set)`                                                                                             | Examine pending signals.                       |
+| 63  | `sys_sethostname`  | `int sethostname(const char *name, size_t len)`                                                                             | Set hostname.                                  |
+| 64  | `sys_setrlimit`    | `int setrlimit(int resource, const struct rlimit *rlim)`                                                                    | Set resource limits.                           |
+| 65  | `sys_getrlimit`    | `int getrlimit(int resource, struct rlimit *rlim)`                                                                          | Get resource limits.                           |
+| 66  | `sys_getrusage`    | `int getrusage(int who, struct rusage *usage)`                                                                              | Get resource usage.                            |
+| 67  | `sys_gettimeofday` | `int gettimeofday(struct timeval *tv, struct timezone *tz)`                                                                 | Get time.                                      |
+| 68  | `sys_settimeofday` | `int settimeofday(const struct timeval *tv, const struct timezone *tz)`                                                     | Set time.                                      |
+| 69  | `sys_getgroups`    | `int getgroups(int size, gid_t list[])`                                                                                     | Get supplementary group IDs.                   |
+| 70  | `sys_setgroups`    | `int setgroups(size_t size, const gid_t *list)`                                                                             | Set supplementary group IDs.                   |
+| 71  | `sys_select`       | `int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)`                       | Synchronous I/O multiplexing.                  |
+| 72  | `sys_symlink`      | `int symlink(const char *target, const char *linkpath)`                                                                     | Make a new name for a file.                    |
+| 73  | `sys_lstat`        | `int lstat(const char *pathname, struct stat *statbuf)`                                                                     | Get file status.                               |
+| 74  | `sys_readlink`     | `ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)`                                                          | Read value of a symbolic link.                 |
+| 75  | `sys_uselib`       | `int uselib(const char *library)`                                                                                           | Select shared library.                         |
+| 76  | `sys_swapon`       | `int swapon(const char *path, int swapflags)`                                                                               | Start/stop swapping to file/device.            |
+| 77  | `sys_reboot`       | `int reboot(int magic, int magic2, int cmd, void *arg)`                                                                     | Reboot or enable/disable Ctrl-Alt-Del.         |
+| 78  | `sys_readdir`      | `int readdir(unsigned int fd, struct old_linux_dirent *dirp, unsigned int count)`                                           | Read directory entry.                          |
+| 79  | `sys_mmap`         | `void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)`                                          | Map files or devices into memory.              |
+| 80  | `sys_munmap`       | `int munmap(void *addr, size_t length)`                                                                                     | Unmap files or devices.                        |
+| 81  | `sys_truncate`     | `int truncate(const char *path, off_t length)`                                                                              | Truncate a file to a specified length.         |
+| 82  | `sys_ftruncate`    | `int ftruncate(int fd, off_t length)`                                                                                       | Truncate a file to a specified length.         |
+| 83  | `sys_fchmod`       | `int fchmod(int fd, mode_t mode)`                                                                                           | Change permissions of a file.                  |
+| 84  | `sys_fchown`       | `int fchown(int fd, uid_t owner, gid_t group)`                                                                              | Change ownership of a file.                    |
+| 85  | `sys_getpriority`  | `int getpriority(int which, id_t who)`                                                                                      | Get program scheduling priority.               |
+| 86  | `sys_setpriority`  | `int setpriority(int which, id_t who, int prio)`                                                                            | Set program scheduling priority.               |
+| 87  | `sys_statfs`       | `int statfs(const char *path, struct statfs *buf)`                                                                          | Get filesystem statistics.                     |
+| 88  | `sys_fstatfs`      | `int fstatfs(int fd, struct statfs *buf)`                                                                                   | Get filesystem statistics.                     |
+| 89  | `sys_ioperm`       | `int ioperm(unsigned long from, unsigned long num, int turn_on)`                                                            | Set port input/output permissions.             |
+| 90  | `sys_socketcall`   | `int socketcall(int call, unsigned long *args)`                                                                             | Socket system calls (multiplexer).             |
+| 91  | `sys_syslog`       | `int syslog(int type, char *bufp, int len)`                                                                                 | Read and/or clear kernel message ring buffer.  |
+| 92  | `sys_setitimer`    | `int setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value)`                                  | Set value of an interval timer.                |
+| 93  | `sys_getitimer`    | `int getitimer(int which, struct itimerval *curr_value)`                                                                    | Get value of an interval timer.                |
+| 94  | `sys_newstat`      | `int newstat(const char *pathname, struct stat *statbuf)`                                                                   | Get file status.                               |
+| 95  | `sys_newlstat`     | `int newlstat(const char *pathname, struct stat *statbuf)`                                                                  | Get file status.                               |
+| 96  | `sys_newfstat`     | `int newfstat(int fd, struct stat *statbuf)`                                                                                | Get file status.                               |
+| 97  | `sys_uname`        | `int uname(struct utsname *buf)`                                                                                            | Get name and information about current kernel. |
+| 98  | `sys_iopl`         | `int iopl(int level)`                                                                                                       | Change I/O privilege level.                    |
+| 99  | `sys_vhangup`      | `int vhangup(void)`                                                                                                         | Virtually hangup the current terminal.         |
 
 ## Appendix B: Error Codes
 
 List of all standard `errno` values returned by system calls.
 
-| Code | Name | Description |
-| ---- | ---- | ----------- |
-| 1 | `EPERM` | Operation not permitted |
-| 2 | `ENOENT` | No such file or directory |
-| 3 | `ESRCH` | No such process |
-| 4 | `EINTR` | Interrupted system call |
-| 5 | `EIO` | I/O error |
-| 6 | `ENXIO` | No such device or address |
-| 7 | `E2BIG` | Argument list too long |
-| 8 | `ENOEXEC` | Exec format error |
-| 9 | `EBADF` | Bad file number |
-| 10 | `ECHILD` | No child processes |
-| 11 | `EAGAIN` | Try again |
-| 12 | `ENOMEM` | Out of memory |
-| 13 | `EACCES` | Permission denied |
-| 14 | `EFAULT` | Bad address |
-| 15 | `ENOTBLK` | Block device required |
-| 16 | `EBUSY` | Device or resource busy |
-| 17 | `EEXIST` | File exists |
-| 18 | `EXDEV` | Cross-device link |
-| 19 | `ENODEV` | No such device |
-| 20 | `ENOTDIR` | Not a directory |
-| 21 | `EISDIR` | Is a directory |
-| 22 | `EINVAL` | Invalid argument |
-| 23 | `ENFILE` | File table overflow |
-| 24 | `EMFILE` | Too many open files |
-| 25 | `ENOTTY` | Not a typewriter |
-| 26 | `ETXTBSY` | Text file busy |
-| 27 | `EFBIG` | File too large |
-| 28 | `ENOSPC` | No space left on device |
-| 29 | `ESPIPE` | Illegal seek |
-| 30 | `EROFS` | Read-only file system |
-| 31 | `EMLINK` | Too many links |
-| 32 | `EPIPE` | Broken pipe |
-| 33 | `EDOM` | Math argument out of domain of func |
-| 34 | `ERANGE` | Math result not representable |
-| 35 | `EDEADLK` | Resource deadlock would occur |
-| 36 | `ENAMETOOLONG` | File name too long |
-| 37 | `ENOLCK` | No record locks available |
-| 38 | `ENOSYS` | Function not implemented |
-| 39 | `ENOTEMPTY` | Directory not empty |
-| 40 | `ELOOP` | Too many symbolic links encountered |
-| 42 | `ENOMSG` | No message of desired type |
-| 43 | `EIDRM` | Identifier removed |
-| 44 | `ECHRNG` | Channel number out of range |
-| 45 | `EL2NSYNC` | Level 2 not synchronized |
-| 46 | `EL3HLT` | Level 3 halted |
-| 47 | `EL3RST` | Level 3 reset |
-| 48 | `ELNRNG` | Link number out of range |
-| 49 | `EUNATCH` | Protocol driver not attached |
-| 50 | `ENOCSI` | No CSI structure available |
-| 51 | `EL2HLT` | Level 2 halted |
-| 52 | `EBADE` | Invalid exchange |
-| 53 | `EBADR` | Invalid request descriptor |
-| 54 | `EXFULL` | Exchange full |
-| 55 | `ENOANO` | No anode |
-| 56 | `EBADRQC` | Invalid request code |
-| 57 | `EBADSLT` | Invalid slot |
-| 59 | `EBFONT` | Bad font file format |
-| 60 | `ENOSTR` | Device not a stream |
-| 61 | `ENODATA` | No data available |
-| 62 | `ETIME` | Timer expired |
-| 63 | `ENOSR` | Out of streams resources |
-| 64 | `ENONET` | Machine is not on the network |
-| 65 | `ENOPKG` | Package not installed |
-| 66 | `EREMOTE` | Object is remote |
-| 67 | `ENOLINK` | Link has been severed |
-| 68 | `EADV` | Advertise error |
-| 69 | `ESRMNT` | Srmount error |
-| 70 | `ECOMM` | Communication error on send |
-| 71 | `EPROTO` | Protocol error |
-| 72 | `EMULTIHOP` | Multihop attempted |
-| 73 | `EDOTDOT` | RFS specific error |
-| 74 | `EBADMSG` | Not a data message |
-| 75 | `EOVERFLOW` | Value too large for defined data type |
-| 76 | `ENOTUNIQ` | Name not unique on network |
-| 77 | `EBADFD` | File descriptor in bad state |
-| 78 | `EREMCHG` | Remote address changed |
-| 79 | `ELIBACC` | Can not access a needed shared library |
-| 80 | `ELIBBAD` | Accessing a corrupted shared library |
-| 81 | `ELIBSCN` | .lib section in a.out corrupted |
-| 82 | `ELIBMAX` | Attempting to link in too many shared libraries |
-| 83 | `ELIBEXEC` | Cannot exec a shared library directly |
-| 84 | `EILSEQ` | Illegal byte sequence |
-| 85 | `ERESTART` | Interrupted system call should be restarted |
-| 86 | `ESTRPIPE` | Streams pipe error |
-| 87 | `EUSERS` | Too many users |
-| 88 | `ENOTSOCK` | Socket operation on non-socket |
-| 89 | `EDESTADDRREQ` | Destination address required |
-| 90 | `EMSGSIZE` | Message too long |
-| 91 | `EPROTOTYPE` | Protocol wrong type for socket |
-| 92 | `ENOPROTOOPT` | Protocol not available |
-| 93 | `EPROTONOSUPPORT` | Protocol not supported |
-| 94 | `ESOCKTNOSUPPORT` | Socket type not supported |
-| 95 | `EOPNOTSUPP` | Operation not supported on transport endpoint |
-| 96 | `EPFNOSUPPORT` | Protocol family not supported |
-| 97 | `EAFNOSUPPORT` | Address family not supported by protocol |
-| 98 | `EADDRINUSE` | Address already in use |
-| 99 | `EADDRNOTAVAIL` | Cannot assign requested address |
-| 100 | `ENETDOWN` | Network is down |
-| 101 | `ENETUNREACH` | Network is unreachable |
-| 102 | `ENETRESET` | Network dropped connection because of reset |
-| 103 | `ECONNABORTED` | Software caused connection abort |
-| 104 | `ECONNRESET` | Connection reset by peer |
-| 105 | `ENOBUFS` | No buffer space available |
-| 106 | `EISCONN` | Transport endpoint is already connected |
-| 107 | `ENOTCONN` | Transport endpoint is not connected |
-| 108 | `ESHUTDOWN` | Cannot send after transport endpoint shutdown |
-| 109 | `ETOOMANYREFS` | Too many references: cannot splice |
-| 110 | `ETIMEDOUT` | Connection timed out |
-| 111 | `ECONNREFUSED` | Connection refused |
-| 112 | `EHOSTDOWN` | Host is down |
-| 113 | `EHOSTUNREACH` | No route to host |
-| 114 | `EALREADY` | Operation already in progress |
-| 115 | `EINPROGRESS` | Operation now in progress |
-| 116 | `ESTALE` | Stale file handle |
-| 117 | `EUCLEAN` | Structure needs cleaning |
-| 118 | `ENOTNAM` | Not a XENIX named type file |
-| 119 | `ENAVAIL` | No XENIX semaphores available |
-| 120 | `EISNAM` | Is a named type file |
-| 121 | `EREMOTEIO` | Remote I/O error |
-| 122 | `EDQUOT` | Quota exceeded |
-| 123 | `ENOMEDIUM` | No medium found |
-| 124 | `EMEDIUMTYPE` | Wrong medium type |
-| 125 | `ECANCELED` | Operation Canceled |
-| 126 | `ENOKEY` | Required key not available |
-| 127 | `EKEYEXPIRED` | Key has expired |
-| 128 | `EKEYREVOKED` | Key has been revoked |
-| 129 | `EKEYREJECTED` | Key was rejected by service |
-| 130 | `EOWNERDEAD` | Owner died |
-| 131 | `ENOTRECOVERABLE` | State not recoverable |
-
+| Code | Name              | Description                                     |
+| ---- | ----------------- | ----------------------------------------------- |
+| 1    | `EPERM`           | Operation not permitted                         |
+| 2    | `ENOENT`          | No such file or directory                       |
+| 3    | `ESRCH`           | No such process                                 |
+| 4    | `EINTR`           | Interrupted system call                         |
+| 5    | `EIO`             | I/O error                                       |
+| 6    | `ENXIO`           | No such device or address                       |
+| 7    | `E2BIG`           | Argument list too long                          |
+| 8    | `ENOEXEC`         | Exec format error                               |
+| 9    | `EBADF`           | Bad file number                                 |
+| 10   | `ECHILD`          | No child processes                              |
+| 11   | `EAGAIN`          | Try again                                       |
+| 12   | `ENOMEM`          | Out of memory                                   |
+| 13   | `EACCES`          | Permission denied                               |
+| 14   | `EFAULT`          | Bad address                                     |
+| 15   | `ENOTBLK`         | Block device required                           |
+| 16   | `EBUSY`           | Device or resource busy                         |
+| 17   | `EEXIST`          | File exists                                     |
+| 18   | `EXDEV`           | Cross-device link                               |
+| 19   | `ENODEV`          | No such device                                  |
+| 20   | `ENOTDIR`         | Not a directory                                 |
+| 21   | `EISDIR`          | Is a directory                                  |
+| 22   | `EINVAL`          | Invalid argument                                |
+| 23   | `ENFILE`          | File table overflow                             |
+| 24   | `EMFILE`          | Too many open files                             |
+| 25   | `ENOTTY`          | Not a typewriter                                |
+| 26   | `ETXTBSY`         | Text file busy                                  |
+| 27   | `EFBIG`           | File too large                                  |
+| 28   | `ENOSPC`          | No space left on device                         |
+| 29   | `ESPIPE`          | Illegal seek                                    |
+| 30   | `EROFS`           | Read-only file system                           |
+| 31   | `EMLINK`          | Too many links                                  |
+| 32   | `EPIPE`           | Broken pipe                                     |
+| 33   | `EDOM`            | Math argument out of domain of func             |
+| 34   | `ERANGE`          | Math result not representable                   |
+| 35   | `EDEADLK`         | Resource deadlock would occur                   |
+| 36   | `ENAMETOOLONG`    | File name too long                              |
+| 37   | `ENOLCK`          | No record locks available                       |
+| 38   | `ENOSYS`          | Function not implemented                        |
+| 39   | `ENOTEMPTY`       | Directory not empty                             |
+| 40   | `ELOOP`           | Too many symbolic links encountered             |
+| 42   | `ENOMSG`          | No message of desired type                      |
+| 43   | `EIDRM`           | Identifier removed                              |
+| 44   | `ECHRNG`          | Channel number out of range                     |
+| 45   | `EL2NSYNC`        | Level 2 not synchronized                        |
+| 46   | `EL3HLT`          | Level 3 halted                                  |
+| 47   | `EL3RST`          | Level 3 reset                                   |
+| 48   | `ELNRNG`          | Link number out of range                        |
+| 49   | `EUNATCH`         | Protocol driver not attached                    |
+| 50   | `ENOCSI`          | No CSI structure available                      |
+| 51   | `EL2HLT`          | Level 2 halted                                  |
+| 52   | `EBADE`           | Invalid exchange                                |
+| 53   | `EBADR`           | Invalid request descriptor                      |
+| 54   | `EXFULL`          | Exchange full                                   |
+| 55   | `ENOANO`          | No anode                                        |
+| 56   | `EBADRQC`         | Invalid request code                            |
+| 57   | `EBADSLT`         | Invalid slot                                    |
+| 59   | `EBFONT`          | Bad font file format                            |
+| 60   | `ENOSTR`          | Device not a stream                             |
+| 61   | `ENODATA`         | No data available                               |
+| 62   | `ETIME`           | Timer expired                                   |
+| 63   | `ENOSR`           | Out of streams resources                        |
+| 64   | `ENONET`          | Machine is not on the network                   |
+| 65   | `ENOPKG`          | Package not installed                           |
+| 66   | `EREMOTE`         | Object is remote                                |
+| 67   | `ENOLINK`         | Link has been severed                           |
+| 68   | `EADV`            | Advertise error                                 |
+| 69   | `ESRMNT`          | Srmount error                                   |
+| 70   | `ECOMM`           | Communication error on send                     |
+| 71   | `EPROTO`          | Protocol error                                  |
+| 72   | `EMULTIHOP`       | Multihop attempted                              |
+| 73   | `EDOTDOT`         | RFS specific error                              |
+| 74   | `EBADMSG`         | Not a data message                              |
+| 75   | `EOVERFLOW`       | Value too large for defined data type           |
+| 76   | `ENOTUNIQ`        | Name not unique on network                      |
+| 77   | `EBADFD`          | File descriptor in bad state                    |
+| 78   | `EREMCHG`         | Remote address changed                          |
+| 79   | `ELIBACC`         | Can not access a needed shared library          |
+| 80   | `ELIBBAD`         | Accessing a corrupted shared library            |
+| 81   | `ELIBSCN`         | .lib section in a.out corrupted                 |
+| 82   | `ELIBMAX`         | Attempting to link in too many shared libraries |
+| 83   | `ELIBEXEC`        | Cannot exec a shared library directly           |
+| 84   | `EILSEQ`          | Illegal byte sequence                           |
+| 85   | `ERESTART`        | Interrupted system call should be restarted     |
+| 86   | `ESTRPIPE`        | Streams pipe error                              |
+| 87   | `EUSERS`          | Too many users                                  |
+| 88   | `ENOTSOCK`        | Socket operation on non-socket                  |
+| 89   | `EDESTADDRREQ`    | Destination address required                    |
+| 90   | `EMSGSIZE`        | Message too long                                |
+| 91   | `EPROTOTYPE`      | Protocol wrong type for socket                  |
+| 92   | `ENOPROTOOPT`     | Protocol not available                          |
+| 93   | `EPROTONOSUPPORT` | Protocol not supported                          |
+| 94   | `ESOCKTNOSUPPORT` | Socket type not supported                       |
+| 95   | `EOPNOTSUPP`      | Operation not supported on transport endpoint   |
+| 96   | `EPFNOSUPPORT`    | Protocol family not supported                   |
+| 97   | `EAFNOSUPPORT`    | Address family not supported by protocol        |
+| 98   | `EADDRINUSE`      | Address already in use                          |
+| 99   | `EADDRNOTAVAIL`   | Cannot assign requested address                 |
+| 100  | `ENETDOWN`        | Network is down                                 |
+| 101  | `ENETUNREACH`     | Network is unreachable                          |
+| 102  | `ENETRESET`       | Network dropped connection because of reset     |
+| 103  | `ECONNABORTED`    | Software caused connection abort                |
+| 104  | `ECONNRESET`      | Connection reset by peer                        |
+| 105  | `ENOBUFS`         | No buffer space available                       |
+| 106  | `EISCONN`         | Transport endpoint is already connected         |
+| 107  | `ENOTCONN`        | Transport endpoint is not connected             |
+| 108  | `ESHUTDOWN`       | Cannot send after transport endpoint shutdown   |
+| 109  | `ETOOMANYREFS`    | Too many references: cannot splice              |
+| 110  | `ETIMEDOUT`       | Connection timed out                            |
+| 111  | `ECONNREFUSED`    | Connection refused                              |
+| 112  | `EHOSTDOWN`       | Host is down                                    |
+| 113  | `EHOSTUNREACH`    | No route to host                                |
+| 114  | `EALREADY`        | Operation already in progress                   |
+| 115  | `EINPROGRESS`     | Operation now in progress                       |
+| 116  | `ESTALE`          | Stale file handle                               |
+| 117  | `EUCLEAN`         | Structure needs cleaning                        |
+| 118  | `ENOTNAM`         | Not a XENIX named type file                     |
+| 119  | `ENAVAIL`         | No XENIX semaphores available                   |
+| 120  | `EISNAM`          | Is a named type file                            |
+| 121  | `EREMOTEIO`       | Remote I/O error                                |
+| 122  | `EDQUOT`          | Quota exceeded                                  |
+| 123  | `ENOMEDIUM`       | No medium found                                 |
+| 124  | `EMEDIUMTYPE`     | Wrong medium type                               |
+| 125  | `ECANCELED`       | Operation Canceled                              |
+| 126  | `ENOKEY`          | Required key not available                      |
+| 127  | `EKEYEXPIRED`     | Key has expired                                 |
+| 128  | `EKEYREVOKED`     | Key has been revoked                            |
+| 129  | `EKEYREJECTED`    | Key was rejected by service                     |
+| 130  | `EOWNERDEAD`      | Owner died                                      |
+| 131  | `ENOTRECOVERABLE` | State not recoverable                           |
