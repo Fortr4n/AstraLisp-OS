@@ -375,7 +375,6 @@ static size_t sweep_generation(struct gc_generation* gen) {
 
 static void collect_young(void) {
     if (!gc_ctx) return;
-    // printf("GC: collect_young start\n");
     gc_ctx->collecting = true;
 
     mark_roots();
@@ -499,4 +498,26 @@ void gc_register_symbol_table(struct hash_table* table) {
 
 void gc_get_stats(struct gc_stats* stats_out) {
     if (gc_ctx && stats_out) *stats_out = gc_ctx->stats;
+}
+
+void gc_dump_heap(void) {
+    if (!gc_ctx) return;
+    FILE* f = fopen("heap.log", "a");
+    if (!f) return;
+    
+    fprintf(f, "GC Heap Dump (Young Gen):\n");
+    struct gc_object_header* obj = gc_ctx->young_gen.objects;
+    while (obj) {
+        void* ptr = get_object(obj);
+        fprintf(f, "Obj %p Header %p Size %u Flags %x Type %d\n", ptr, obj, obj->size, obj->flags, GET_TYPE(ptr));
+        obj = obj->next;
+    }
+    fprintf(f, "GC Heap Dump (Old Gen):\n");
+    obj = gc_ctx->old_gen.objects;
+    while (obj) {
+        void* ptr = get_object(obj);
+        fprintf(f, "Obj %p Header %p Size %u Flags %x Type %d\n", ptr, obj, obj->size, obj->flags, GET_TYPE(ptr));
+        obj = obj->next;
+    }
+    fclose(f);
 }

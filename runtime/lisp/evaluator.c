@@ -25,11 +25,14 @@ static inline bool is_builtin(lisp_value obj) {
 
 #define IS_ENV(x) is_env(x)
 #define IS_BUILTIN(x) is_builtin(x)
-
+    
 /* Initialize evaluator */
 int evaluator_init(void) {
     /* Initialize Symbol System first */
     if (symbols_init() != 0) return -1;
+    
+    /* Register symbol table as GC root */
+    gc_register_symbol_table(lisp_get_symbol_table());
     
     /* Create global environment */
     /* We need to register global_env as a root since it persists */
@@ -91,8 +94,16 @@ void lisp_env_bind(lisp_value env, lisp_value symbol, lisp_value value) {
     if (!e->table) return;
     
     ht_put(e->table, symbol, value);
-    printf("Debug: Bound symbol "); lisp_print(symbol); printf(" in env %p\n", e);
+    
+    lisp_value check = ht_get(e->table, symbol);
+    if (check != value) {
+        // printf("Debug: FATAL - ht_put failed! check=%llx value=%llx\n", check, value);
+    } else {
+        // printf("Debug: Bound symbol "); lisp_print(symbol); printf(" in env %p to %llx\n", e, value);
+    }
+    
     gc_write_barrier(env, &e->parent, value);
+
 }
 
 /* Lookup variable in environment */
@@ -101,7 +112,7 @@ lisp_value lisp_env_lookup(lisp_value env, lisp_value symbol) {
         struct lisp_env* e = (struct lisp_env*)PTR_VAL(env);
         
         if (e->table && ht_contains(e->table, symbol)) {
-            printf("Debug: Found symbol "); lisp_print(symbol); printf(" in env %p\n", e);
+            // printf("Debug: Found symbol "); lisp_print(symbol); printf(" in env %p\n", e);
             return ht_get(e->table, symbol);
         }
         
@@ -144,14 +155,14 @@ lisp_value lisp_apply(lisp_value env, lisp_value func, lisp_value args) {
         lisp_value closure_env = f->env;
         
         lisp_value new_env = lisp_env_create(closure_env);
-        printf("Debug: Created new_env %llx parent %llx\n", new_env, closure_env);
+        // printf("Debug: Created new_env %llx parent %llx\n", new_env, closure_env);
         GC_PUSH_1(new_env); 
         
         lisp_value p = params;
         lisp_value a = args;
         
         while (IS_CONS(p) && IS_CONS(a)) {
-            printf("Debug: Binding param "); lisp_print(CAR(p)); printf(" to "); lisp_print(CAR(a)); printf("\n");
+            // printf("Debug: Binding param "); lisp_print(CAR(p)); printf(" to "); lisp_print(CAR(a)); printf("\n");
             lisp_env_bind(new_env, CAR(p), CAR(a));
             p = CDR(p);
             a = CDR(a);
@@ -184,8 +195,12 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
     if (IS_SYMBOL(expr)) {
         result = lisp_env_lookup(env, expr);
         if (result == LISP_UNBOUND) {
+             // printf("Debug: Symbol "); lisp_print(expr); 
+             printf(" is UNBOUND in env %p. Addr=%p Type=%d\n", PTR_VAL(env), PTR_VAL(expr), GET_TYPE(PTR_VAL(expr)));
              lisp_error("Unbound variable");
         }
+
+
     } else if (IS_CONS(expr)) {
         lisp_value func_sym = CAR(expr);
         lisp_value args = CDR(expr);
@@ -193,7 +208,7 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
         if (IS_SYMBOL(func_sym)) {
             lisp_value name = SYMBOL_NAME(func_sym);
             struct lisp_string* s = (struct lisp_string*)PTR_VAL(name);
-            printf("Debug: Checking special form: %s\n", s->data);
+            // printf("Debug: Checking special form: %s\n", s->data);
             
             /* Special forms must still be handled by name */
 
@@ -232,8 +247,8 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                 lisp_value body = CDR(CDR(args));
                 
                 lisp_value func = lisp_create_function(body, env, params);
-                if (IS_NIL(func)) printf("Debug: defun failed to create function\n");
-                else printf("Debug: defun created function %llx\n", func);
+                // if (IS_NIL(func)) printf("Debug: defun failed to create function\n");
+                // else printf("Debug: defun created function %llx\n", func);
                 GC_PUSH_1(func);
                 
                 lisp_env_bind(env, name_sym, func);
@@ -258,10 +273,19 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
             } else if (strcmp(s->data, "try") == 0) {
                 /* (try expr handler) */
                 lisp_value expr = CAR(args);
-                lisp_value handler = CAR(CDR(args));
+                lisp_value handler_expr = CAR(CDR(args));
+                lisp_value handler = lisp_eval(env, handler_expr);
+                GC_PUSH_1(handler);
+                
+                if (!IS_FUNCTION(handler) && !IS_BUILTIN(handler)) {
+                    printf("Error: try handler is not a function\n");
+                    GC_POP();
+                    goto done;
+                }
                 
                 struct error_handler eh;
                 lisp_push_handler(&eh);
+
                 
                 if (setjmp(eh.buf) == 0) {
                     /* Normal execution */
@@ -284,12 +308,14 @@ lisp_value lisp_eval(lisp_value env, lisp_value expr) {
                     GC_POP(); /* handler_args */
                     GC_POP(); /* msg */
                 }
+                GC_POP(); /* handler */
                 goto done;
             }
+
         }
         
         lisp_value func = lisp_eval(env, func_sym);
-        printf("Debug: Evaluated function symbol "); lisp_print(func_sym); printf(" -> %llx (type %d)\n", func, IS_POINTER(func) ? GET_TYPE(PTR_VAL(func)) : -1);
+        // printf("Debug: Evaluated function symbol "); lisp_print(func_sym); printf(" -> %llx (type %d)\n", func, IS_POINTER(func) ? GET_TYPE(PTR_VAL(func)) : -1);
         GC_PUSH_1(func);
 
         

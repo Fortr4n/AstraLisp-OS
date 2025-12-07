@@ -127,9 +127,12 @@ lisp_value lisp_create_string(const char* data, size_t length) {
     if (!str) return LISP_NIL;
     
     SET_TYPE(&str->header, TYPE_STRING);
+    printf("Debug: Alloc String %p Type=%d\n", PTR_TO_VAL(str), GET_TYPE(PTR_TO_VAL(str)));
+
     str->length = length;
     memcpy(str->data, data, length);
     str->data[length] = '\0';
+
     
     return PTR_TO_VAL(str);
 }
@@ -258,6 +261,46 @@ static lisp_value read_atom(struct reader_context* ctx) {
     return lisp_create_symbol(buffer);
 }
 
+/* Read string literal with escape sequence support */
+static lisp_value read_string(struct reader_context* ctx) {
+    next(ctx); /* Skip opening double quote */
+    
+    char buffer[1024];
+    int idx = 0;
+    
+    while (ctx->pos < ctx->len) {
+        char c = next(ctx);
+        
+        if (c == '"') {
+            /* End of string */
+            buffer[idx] = '\0';
+            return lisp_create_string(buffer, idx);
+        } else if (c == '\\') {
+            /* Escape sequence */
+            if (ctx->pos >= ctx->len) break;
+            char escaped = next(ctx);
+            switch (escaped) {
+                case 'n':  buffer[idx++] = '\n'; break;
+                case 't':  buffer[idx++] = '\t'; break;
+                case 'r':  buffer[idx++] = '\r'; break;
+                case '\\': buffer[idx++] = '\\'; break;
+                case '"':  buffer[idx++] = '"';  break;
+                case '0':  buffer[idx++] = '\0'; break;
+                default:   buffer[idx++] = escaped; break;
+            }
+        } else if (c == '\0') {
+            /* Unexpected end of input */
+            break;
+        } else {
+            if (idx < 1023) buffer[idx++] = c;
+        }
+    }
+    
+    /* Unterminated string - return what we have */
+    buffer[idx] = '\0';
+    return lisp_create_string(buffer, idx);
+}
+
 /* Read object */
 lisp_value reader_read(struct reader_context* ctx) {
     skip_whitespace(ctx);
@@ -267,6 +310,9 @@ lisp_value reader_read(struct reader_context* ctx) {
     char c = peek(ctx);
     if (c == '(') {
         return read_list(ctx);
+    } else if (c == '"') {
+        /* String literal */
+        return read_string(ctx);
     } else if (c == '\'') {
         next(ctx);
         lisp_value expr = reader_read(ctx);
