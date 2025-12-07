@@ -70,19 +70,14 @@ static inline void invalidate_tlb(uintptr_t va) {
 #endif
 }
 
+#include "../arch/ppc64/radix.h"
+
 /* Helper: Reload CR3 / PT Base */
 static inline void load_pt_base(uintptr_t phys) {
-    /* For PowerISA Radix, we would write to the Process Table or PIDR/PTCR */
-    /* For this implementation, we assume we are setting the root pointer */
-    /* This is a simplification; real PowerISA Radix requires Process Table setup */
-    /* But for "4-level page table management" task, this logic is correct */
+    /* For PowerISA Radix, update the Process Table Entry for PID 0 (Kernel) */
+    radix_set_root(0, (uint64_t)phys);
     
-    /* Placeholder for actual register write */
-#ifndef TEST_MODE
-    /* __asm__ volatile("mtspr 25, %0" :: "r"(phys)); */ /* SDR1 equivalent */
-#else
-    (void)phys;
-#endif
+    /* Also switch to PID 0 context if needed, but we assume we are running in PID 0 */
 }
 
 /* Allocate a new page table (zeroed) */
@@ -135,6 +130,9 @@ static pt_entry_t* get_next_table(pt_entry_t* entry, bool alloc) {
 
 /* Initialize VMM */
 int vmm_init(void) {
+    /* Initialize Radix Hardware (Partition Table / Process Table) */
+    radix_init_hypervisor();
+
     /* Allocate Kernel PML4 */
     void* phys_pml4 = pmm_alloc();
     if (!phys_pml4) return -1;

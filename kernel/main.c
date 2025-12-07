@@ -1,65 +1,16 @@
-/* AstraLisp OS Kernel Main Entry Point */
-
-#include <stdint.h>
-#include <stddef.h>
-#include "hal/serial.h"
-#include "hal/vga.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
-#include "mm/heap.h"
-#include "interrupt/idt.h"
-#include "process/scheduler.h"
-#include "process/process.h"
-#include "../runtime/gc/gc.h"
-#include "../runtime/lisp/evaluator.h"
-#include "../runtime/lisp/reader.h"
-#include "../runtime/lisp/drivers.h"
-#include "../runtime/lisp/objects.h"
-
-
-/* Forward declarations */
-extern void interrupt_handler(uint32_t interrupt_number, void* stack_frame);
-extern void exception_handler(uint32_t exception_number, void* stack_frame);
-extern void* syscall_handler(uint32_t syscall_number, void* args);
-
-#include "multiboot2.h"
-
-/* Kernel panic handler */
-void kernel_panic(const char* message) {
-    serial_puts("KERNEL PANIC: ");
-    serial_puts(message);
-    serial_puts("\n");
-    
-    vga_puts("KERNEL PANIC: ");
-    vga_puts(message);
-    vga_puts("\n");
-    
-    /* Halt */
-    for (;;) {
-        __asm__ volatile ("nop");
-    }
-}
-
-/* Early printf implementation */
-void early_printf(const char* format, ...) {
-    /* Simple implementation for now */
-    serial_puts(format);
-}
+#include "drivers/opal/opal.h"
 
 /* Kernel main entry point */
-void kernel_main(uint32_t magic, struct multiboot_info* mbi) {
-    /* Initialize serial console first */
-    serial_init();
-    serial_puts("AstraLisp OS Kernel Starting...\n");
-    
-    /* Initialize VGA */
-    vga_init();
-    vga_puts("AstraLisp OS Kernel Starting...\n");
-    
-    /* Verify multiboot magic */
-    if (magic != 0x36D76289) {
-        kernel_panic("Invalid multiboot magic number");
+/* For PowerISA/Skiboot, r3 is FDT pointer (passed as generic arg1) */
+void kernel_main(void* fdt) {
+    /* Initialize OPAL (via FDT) */
+    if (opal_init(fdt) != 0) {
+        /* Loops if fails since we can't print */
+        for (;;) ;
     }
+    
+    opal_puts("AstraLisp OS Kernel Starting (PowerISA v3.1C)...\n");
+
     
     early_printf("Multiboot info at: 0x%p\n", mbi);
     
