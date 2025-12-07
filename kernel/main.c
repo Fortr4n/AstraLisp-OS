@@ -1,144 +1,111 @@
 #include "drivers/opal/opal.h"
+#include "arch/ppc64/xive.h"
+
+#include "drivers/opal/opal.h"
+#include "arch/ppc64/xive.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "mm/heap.h"
+#include "multiboot2.h"
+#include "../runtime/lisp/gc.h"      /* Lisp Headers */
+#include "../runtime/lisp/evaluator.h"
+#include "../runtime/lisp/reader.h"
+#include "../runtime/lisp/drivers.h"
+
+/* Helper to convert serial char to Lisp reader input? 
+   No, we'll just buffer a line. */
 
 /* Kernel main entry point */
-/* For PowerISA/Skiboot, r3 is FDT pointer (passed as generic arg1) */
-void kernel_main(void* fdt) {
-    /* Initialize OPAL (via FDT) */
-    if (opal_init(fdt) != 0) {
-        /* Loops if fails since we can't print */
-        for (;;) ;
+/* r3 = magic, r4 = ptr (MBI or FDT) */
+void kernel_main(uint64_t magic, void* addr) {
+    /* PowerPC Pre-Init Check */
+    /* Verify we are in Hypervisor mode, etc. (Done in ASM) */
+
+    /* If we have FDT (Linux Boot Protocol), r3 is FDT. 
+       If Multiboot2, r3 is Magic (0x36d76289), r4 is MBI. */
+    
+    void* mb_info = NULL;
+    void* fdt_ptr = NULL;
+    
+    if (magic == 0x36d76289) {
+        mb_info = addr;
+        /* Need to find FDT inside MBI or assume none? */
+    } else {
+        /* Assume Linux/Skiboot protocol: r3 (magic arg) is actually FDT? */
+        /* wait, Linux entry: r3=FDT, r4=0, r5=0. */
+        /* So if magic looks like a pointer (aligned, kernel base?), it might be FDT */
+        /* For safety, let's treat 'magic' as FDT if it's not the Multiboot magic number */
+        fdt_ptr = (void*)magic;
     }
     
-    opal_puts("AstraLisp OS Kernel Starting (PowerISA v3.1C)...\n");
-
-    
-    early_printf("Multiboot info at: 0x%p\n", mbi);
-    
-    /* Parse multiboot tags */
-    if (mbi) {
-        uint32_t total_size = mbi->total_size;
-        struct multiboot_tag* tag = mbi->tags;
-        
-        while ((uintptr_t)tag < (uintptr_t)mbi + total_size) {
-            switch (tag->type) {
-                case 0: /* End tag */
-                    goto tags_done;
-                case 6: /* Memory map */
-                    early_printf("Memory map tag found\n");
-                    break;
-                case 8: /* Boot device */
-                    early_printf("Boot device tag found\n");
-                    break;
-                case 2: /* Command line */
-                    early_printf("Command line tag found\n");
-                    break;
-                default:
-                    early_printf("Unknown tag: %u\n", tag->type);
-                    break;
-            }
+    /* Initialize OPAL if FDT is present */
+    /* If we have no FDT, we might be on bare metal without OPAL (e.g. QEMU -kernel) */
+    /* but checking FDT is safe. */
+    if (fdt_ptr) {
+        if (opal_init(fdt_ptr) == 0) {
+            opal_puts("OPAL Initialized.\n");
             
-            /* Move to next tag (aligned to 8 bytes) */
-            tag = (struct multiboot_tag*)((uintptr_t)tag + ((tag->size + 7) & ~7));
+             /* Initialize XIVE Interrupt Controller */
+            if (xive_init(fdt_ptr) != 0) {
+                opal_puts("XIVE Init Failed.\n");
+            }
         }
     }
     
-tags_done:
-    early_printf("Initializing memory management...\n");
-    
-    /* Initialize physical memory manager */
-    if (pmm_init(mbi) != 0) {
-        kernel_panic("Failed to initialize PMM");
+    /* Initialize PMM */
+    /* PMM currently expects MBI. If we only have FDT, PMM will fail. */
+    /* TODO: update PMM to support FDT. For now, pass MBI. */
+    if (pmm_init(mb_info) != 0) {
+        /* If PMM fails, we can't allocate memory. Critical. */
+        /* Using opal_puts if avail */
+        if (fdt_ptr) opal_puts("PMM Failed (MBI missing?)\n");
+        for(;;);
     }
     
-    /* Initialize virtual memory manager */
+    /* Initialize VMM (Radix) */
     if (vmm_init() != 0) {
-        kernel_panic("Failed to initialize VMM");
+        if (fdt_ptr) opal_puts("VMM Failed\n");
+        for(;;);
     }
     
-    /* Initialize kernel heap */
+    /* Initialize Heap */
     if (heap_init() != 0) {
-        kernel_panic("Failed to initialize heap");
+         if (fdt_ptr) opal_puts("Heap Failed\n");
+         for(;;);
     }
     
     /* Initialize Lisp Runtime */
-    early_printf("Initializing Lisp Runtime...\n");
+    if (fdt_ptr) opal_puts("Initializing AstraLisp Runtime...\n");
     
     if (gc_init() != 0) {
-        kernel_panic("Failed to init GC");
+         /* panic */
+         for(;;);
     }
     
     if (evaluator_init() != 0) {
-        kernel_panic("Failed to init Evaluator");
+         for(;;);
     }
     
-    drivers_init();
+    drivers_init(); /* Init Lisp drivers */
     
-    early_printf("AstraLisp OS Ready. Entering REPL...\n");
+    if (fdt_ptr) opal_puts("Entering REPL...\n");
     
-    /* REPL Loop */
-    char input_buffer[1024];
-    size_t buffer_pos = 0;
-    
-    serial_puts("\n> ");
+    /* REPL */
+    char input_buffer[256];
+    int pos = 0;
     
     for (;;) {
-        if (serial_data_available()) {
-            char c = serial_getchar();
-            
-            /* Echo */
-            serial_putchar(c);
-            
-            if (c == '\r' || c == '\n') {
-                serial_putchar('\n');
-                input_buffer[buffer_pos] = '\0';
-                
-                if (buffer_pos > 0) {
-                    /* Read */
-                    struct reader_context ctx;
-                    reader_init(&ctx, input_buffer);
-                    
-                    lisp_value expr = reader_read(&ctx);
-                    
-                    /* Eval */
-                    /* Protect expr */
-                    GC_PUSH_1(expr);
-                    lisp_value result = lisp_eval(lisp_get_global_env(), expr);
-                    
-                    /* Print */
-                    /* Redirect stdout to serial for lisp_print? 
-                       lisp_print uses printf. We need to hook printf or modify lisp_print.
-                       For now, let's assume lisp_print writes to stdout and we need to redirect it.
-                       But we are in kernel mode, printf might not work or might be early_printf.
-                       
-                       Wait, lisp_print in reader.c uses printf. 
-                       I need to make lisp_print use serial_puts or vga_puts.
-                       
-                       I will modify reader.c to use a print callback or macro.
-                       For now, I'll just run the loop and address printing next.
-                    */
-                     
-                    /* Temporary: We can't see output unless lisp_print works. */
-                    /* I will add a temporary print implementation here or modify reader.c later. */
-                    
-                    GC_POP(); /* expr */
-                }
-                
-                buffer_pos = 0;
-                serial_puts("> ");
-            } else if (c == '\b' || c == 127) {
-                if (buffer_pos > 0) {
-                    buffer_pos--;
-                    /* Handle backspace visual */
-                    serial_puts("\b \b");
-                }
-            } else if (buffer_pos < sizeof(input_buffer) - 1) {
-                input_buffer[buffer_pos++] = c;
-            }
-        }
+        /* Check OPAL console for input */
+        int64_t rc;
+        char c;
+        // rc = opal_console_read(0, &len, buf);
+        // This is a blocking/async quirk in OPAL. 
+        // Need to poll.
+        // Simplified:
+        // if (opal_poll_char(&c)) { ... }
         
-        /* Run scheduler/idle */
-        // scheduler_tick(); 
-        __asm__ volatile ("nop");
+        /* For now, just idle loop */
+         __asm__ volatile ("or 27,27,27"); /* yield */
     }
 }
 

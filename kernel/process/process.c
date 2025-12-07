@@ -71,58 +71,70 @@ void process_destroy(struct process* proc) {
 
 /* Create thread */
 struct thread* thread_create(struct process* proc, void (*entry)(void)) {
-    if (!proc) {
-        return NULL;
-    }
+    if (!proc) return NULL;
     
     struct thread* thread = (struct thread*)kmalloc(sizeof(struct thread));
-    if (!thread) {
-        return NULL;
-    }
+    if (!thread) return NULL;
     
     thread->tid = next_tid++;
     thread->process = proc;
+    thread->priority = PRIORITY_NORMAL;
+    thread->state = THREAD_READY;
     thread->sleep_until = 0;
     
-    /* Allocate stack */
-    thread->stack = kmalloc(8192);  /* 8KB stack */
+    /* Allocate stack (16KB) */
+    thread->stack_size = 16 * 1024;
+    thread->stack = kmalloc(thread->stack_size);
     if (!thread->stack) {
         kfree(thread);
         return NULL;
     }
     
-    /* Allocate context */
-    thread->context = kmalloc(816);  /* Context size from context-switch.asm */
-    if (!thread->context) {
-        kfree(thread->stack);
-        kfree(thread);
-        return NULL;
-    }
+    /* Zero the context */
+    memset(&thread->context, 0, sizeof(struct cpu_context));
     
-    /* Set up initial context */
-    /* Stack pointer */
-    uintptr_t* stack = (uintptr_t*)thread->stack;
-    stack += 1024;  /* Top of stack */
-    *((uintptr_t*)thread->context + 1) = (uintptr_t)stack;  /* r1 = stack pointer */
+    /* Set up stack pointer (Highest address - alignment) */
+    uintptr_t stack_top = (uintptr_t)thread->stack + thread->stack_size;
+    stack_top &= ~0xF; /* 16-byte alignment */
     
-    /* Entry point */
-    *((uintptr_t*)thread->context + 32) = (uintptr_t)entry;  /* LR = entry point */
+    /* Initialize Context */
+    thread->context.r1 = stack_top; /* Stack Pointer */
+    thread->context.pc = (uint64_t)entry; /* Program Counter */
+    thread->context.lr = (uintptr_t)entry; /* Link Register (as fallback) */
     
-    /* Add to process */
+    /* R2 (TOC) - We need the kernel TOC. */
+    /* Assuming we are running same kernel binary. Read current r2? */
+    /* Or use a global symbol for TOC base. */
+    /* In start.S we set r2 from .TOC. symbol. */
+    /* Let's read r2 from current execution to pass to new thread. */
+    register uint64_t current_r2 asm("r2");
+    thread->context.r2 = current_r2;
+    
+    /* MSR (Machine State Register) */
+    /* Enable: 64-bit (SF), FP (FP), Vector (Vec)? */
+    /* SF=1 (63), HV=1 (60)? We are in hypervisor mode. */
+    /* MSR: SF(63)=1, HV(60)=1, EE(15)=1 (Interrupts), PR(14)=0 (Kernel) */
+    /* ME(12)=1 (Machine Check) */
+    /* IR/DR (Relocation)? If VMM active, yes. */
+    /* For now, just copy current MSR or use safe default. */
+    uint64_t msr;
+    __asm__ volatile ("mfmsr %0" : "=r"(msr));
+    thread->context.msr = msr; /* Inherit current MSR */
+
+    /* Add to process list */
     thread->next = proc->threads;
+    if (proc->threads) proc->threads->prev = thread;
     proc->threads = thread;
+    thread->prev = NULL;
     
     return thread;
 }
 
 /* Destroy thread */
 void thread_destroy(struct thread* thread) {
-    if (!thread) {
-        return;
-    }
+    if (!thread) return;
     
-    kfree(thread->context);
-    kfree(thread->stack);
+    if (thread->stack) kfree(thread->stack);
     kfree(thread);
 }
 

@@ -42,6 +42,8 @@ struct thread {
     struct cpu_context context;
     enum thread_priority priority;
     enum thread_state state;
+    void* stack;
+    uintptr_t stack_size;
     uint64_t sleep_until;
     uint64_t time_slice;
     struct thread* next;

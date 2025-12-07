@@ -2,18 +2,19 @@
 
 #include "pmm.h"
 #include "../multiboot2.h"
+#include "../sync/spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 
+/* Linker symbols */
+extern char kernel_start[];
+extern char kernel_end[];
+
 #define PAGE_SIZE 4096
 #define FRAMES_PER_BYTE 8
 #define FRAME_SIZE PAGE_SIZE
-
-#ifdef TEST_MODE
-#include <stdio.h>
-#endif
 
 /* Bitmap for tracking free frames */
 static uint8_t* frame_bitmap = NULL;
@@ -22,6 +23,8 @@ static size_t total_frames = 0;
 static size_t used_frames = 0;
 static size_t reserved_frames = 0;
 static uintptr_t highest_address = 0;
+
+static spinlock_t pmm_lock;
 
 /* Memory regions */
 #define MAX_MEMORY_REGIONS 64
@@ -64,22 +67,13 @@ static inline bool test_frame(uintptr_t frame_idx) {
     return (frame_bitmap[idx] & (1 << off)) != 0;
 }
 
-#ifdef TEST_MODE
-#include <stdio.h>
-#endif
-
 /* Initialize physical memory manager */
 int pmm_init(void* multiboot_info_ptr) {
-    struct multiboot_info* mbi = (struct multiboot_info*)multiboot_info_ptr;
+    spinlock_init(&pmm_lock);
     
-    if (!mbi) {
-#ifdef TEST_MODE
-        printf("PMM: mbi is NULL\n");
-#endif
-        return -1;
-    }
+    struct multiboot_info* mbi = (struct multiboot_info*)multiboot_info_ptr;
+    if (!mbi) return -1;
 
-    /* 1. Parse Multiboot tags to find memory map */
     struct multiboot_tag* tag;
     for (tag = (struct multiboot_tag*)(mbi->tags);
          tag->type != MULTIBOOT_TAG_TYPE_END;
@@ -97,13 +91,8 @@ int pmm_init(void* multiboot_info_ptr) {
                     regions[region_count].base = entry->addr;
                     regions[region_count].length = entry->len;
                     regions[region_count].type = entry->type;
-#ifdef TEST_MODE
-                    printf("PMM: Region %d: Base %llx, Len %llx, Type %d\n", 
-                           region_count, regions[region_count].base, regions[region_count].length, regions[region_count].type);
-#endif
                     region_count++;
                     
-                    /* Track highest address to size the bitmap */
                     if (entry->type == MULTIBOOT_MEMORY_AVAILABLE) {
                         uint64_t end = entry->addr + entry->len;
                         if (end > highest_address) {
@@ -115,107 +104,90 @@ int pmm_init(void* multiboot_info_ptr) {
         }
     }
 
-    if (highest_address == 0) {
-#ifdef TEST_MODE
-        printf("PMM: No memory found (highest_address=0)\n");
-#endif
-        return -1; /* No memory found */
-    }
+    if (highest_address == 0) return -1;
 
-    /* 2. Calculate bitmap size */
     total_frames = highest_address / PAGE_SIZE;
     frame_bitmap_size = align_up(total_frames / FRAMES_PER_BYTE, PAGE_SIZE);
-#ifdef TEST_MODE
-    printf("PMM: Total frames: %zu, Bitmap size: %zu\n", total_frames, frame_bitmap_size);
-#endif
 
-    /* 3. Find a place to put the bitmap */
-    /* We need a contiguous block of free memory large enough for the bitmap */
+    /* Allocate Bitmap */
     uintptr_t bitmap_phys = 0;
+    uintptr_t k_start = (uintptr_t)kernel_start;
+    uintptr_t k_end = (uintptr_t)kernel_end;
+    
+    /* Ensure kernel end is aligned */
+    if (k_end == 0) k_end = 0x2000000; /* Fallback if symbols missing */
+    k_end = align_up(k_end, PAGE_SIZE);
+
     for (int i = 0; i < region_count; i++) {
         if (regions[i].type == MULTIBOOT_MEMORY_AVAILABLE) {
+            /* Check if region is large enough */
             if (regions[i].length >= frame_bitmap_size) {
-                /* Use the start of this region, but ensure it doesn't overlap kernel */
-                /* Assuming kernel is loaded at 0x1000000 and is < 16MB for now */
-                /* TODO: Get actual kernel end from linker symbol */
-                uintptr_t kernel_end = 0x2000000; 
+                uintptr_t r_start = regions[i].base;
+                uintptr_t r_end = regions[i].base + regions[i].length;
                 
-                uintptr_t region_start = regions[i].base;
-                uintptr_t region_end = regions[i].base + regions[i].length;
-
-                if (region_start < kernel_end) {
-                    /* If region starts before kernel end, skip past kernel */
-                    if (region_end > kernel_end + frame_bitmap_size) {
-                         bitmap_phys = kernel_end;
-                         break;
+                /* Avoid kernel overlap */
+                if (r_start < k_end && r_end > k_start) {
+                    /* Overlap. Try to place after kernel. */
+                    if (r_end > k_end + frame_bitmap_size) {
+                        bitmap_phys = k_end;
+                        break;
                     }
                 } else {
-                    bitmap_phys = region_start;
+                    bitmap_phys = r_start;
                     break;
                 }
             }
         }
     }
 
-    if (bitmap_phys == 0) {
-#ifdef TEST_MODE
-        printf("PMM: Could not allocate bitmap\n");
-#endif
-        return -1; /* Could not allocate bitmap */
-    }
+    if (bitmap_phys == 0) return -1;
 
     frame_bitmap = (uint8_t*)P2V(bitmap_phys);
-#ifdef TEST_MODE
-    printf("PMM: Bitmap allocated at %p (phys %llx)\n", frame_bitmap, (uint64_t)bitmap_phys);
-#endif
     
-    /* 4. Initialize bitmap: Mark ALL as used first */
-    memset(frame_bitmap, 0xFF, frame_bitmap_size);
+    /* init logic */
+    memset(frame_bitmap, 0xFF, frame_bitmap_size); /* Mark all used */
     used_frames = total_frames;
-
-    /* 5. Mark available regions as free */
+    
+    /* Free available regions */
     for (int i = 0; i < region_count; i++) {
         if (regions[i].type == MULTIBOOT_MEMORY_AVAILABLE) {
-            uintptr_t start_frame = align_up(regions[i].base, PAGE_SIZE) / PAGE_SIZE;
-            uintptr_t end_frame = align_down(regions[i].base + regions[i].length, PAGE_SIZE) / PAGE_SIZE;
-            
-            for (uintptr_t f = start_frame; f < end_frame; f++) {
-                if (f < total_frames) {
+            uintptr_t start = align_up(regions[i].base, PAGE_SIZE) / PAGE_SIZE;
+            uintptr_t end = align_down(regions[i].base + regions[i].length, PAGE_SIZE) / PAGE_SIZE;
+            for (uintptr_t f = start; f < end; f++) {
+                if (f < total_frames) { /* Boundary check */
                     clear_frame(f);
                     used_frames--;
                 }
             }
         }
     }
-
-    /* 6. Mark bitmap itself as used */
-    uintptr_t bitmap_start_frame = bitmap_phys / PAGE_SIZE;
-    uintptr_t bitmap_end_frame = (bitmap_phys + frame_bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    for (uintptr_t f = bitmap_start_frame; f < bitmap_end_frame; f++) {
-        set_frame(f);
-        used_frames++;
-        reserved_frames++;
-    }
-
-    /* 7. Mark kernel memory as used (0x0 to 0x2000000 approx) */
-    /* TODO: Use linker symbols for exact kernel range */
-    uintptr_t kernel_start_frame = 0;
-    uintptr_t kernel_end_frame = 0x2000000 / PAGE_SIZE;
-    for (uintptr_t f = kernel_start_frame; f < kernel_end_frame; f++) {
+    
+    /* Mark bitmap as used */
+    uintptr_t b_start = bitmap_phys / PAGE_SIZE;
+    uintptr_t b_end = (bitmap_phys + frame_bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uintptr_t f = b_start; f < b_end; f++) {
         if (!test_frame(f)) {
-            set_frame(f);
-            used_frames++;
-            reserved_frames++;
+             set_frame(f);
+             used_frames++;
         }
     }
-
+    
+    /* Mark kernel as used */
+    uintptr_t kern_start_f = k_start / PAGE_SIZE;
+    uintptr_t kern_end_f = (k_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    for (uintptr_t f = kern_start_f; f < kern_end_f; f++) {
+        if (!test_frame(f)) {
+             set_frame(f);
+             used_frames++;
+        }
+    }
+    
     return 0;
 }
 
-/* Allocate a page frame */
 void* pmm_alloc(void) {
-    /* Simple first-fit search */
-    /* Optimization: maintain a 'last_search' index to avoid rescanning from 0 */
+    spinlock_acquire(&pmm_lock);
     static size_t last_search = 0;
     
     for (size_t i = last_search; i < total_frames; i++) {
@@ -223,81 +195,72 @@ void* pmm_alloc(void) {
             set_frame(i);
             used_frames++;
             last_search = i + 1;
+            spinlock_release(&pmm_lock);
             return (void*)(i * PAGE_SIZE);
         }
     }
     
-    /* Wrap around if not found */
     if (last_search > 0) {
         for (size_t i = 0; i < last_search; i++) {
             if (!test_frame(i)) {
                 set_frame(i);
                 used_frames++;
                 last_search = i + 1;
+                spinlock_release(&pmm_lock);
                 return (void*)(i * PAGE_SIZE);
             }
         }
     }
-
-    return NULL; /* Out of memory */
+    
+    spinlock_release(&pmm_lock);
+    return NULL;
 }
 
-/* Free a page frame */
 void pmm_free(void* frame) {
     if (!frame) return;
-    
-    uintptr_t addr = (uintptr_t)frame;
-    uintptr_t f = addr / PAGE_SIZE;
-    
-    if (f >= total_frames) return;
-    
-    if (test_frame(f)) {
+    spinlock_acquire(&pmm_lock);
+    uintptr_t f = (uintptr_t)frame / PAGE_SIZE;
+    if (f < total_frames && test_frame(f)) {
         clear_frame(f);
         used_frames--;
     }
+    spinlock_release(&pmm_lock);
 }
 
-/* Allocate multiple contiguous page frames */
 void* pmm_alloc_multiple(size_t pages) {
     if (pages == 0) return NULL;
     if (pages == 1) return pmm_alloc();
-
-    /* Brute force search for contiguous block */
-    /* TODO: Optimize with buddy allocator or free lists */
+    
+    spinlock_acquire(&pmm_lock);
     
     for (size_t i = 0; i < total_frames - pages; i++) {
         if (!test_frame(i)) {
-            /* Found a free frame, check if next 'pages-1' are also free */
             bool found = true;
             for (size_t j = 1; j < pages; j++) {
                 if (test_frame(i + j)) {
                     found = false;
-                    i += j; /* Skip ahead */
+                    i += j;
                     break;
                 }
             }
-            
             if (found) {
-                /* Mark all as used */
                 for (size_t j = 0; j < pages; j++) {
                     set_frame(i + j);
                     used_frames++;
                 }
+                spinlock_release(&pmm_lock);
                 return (void*)(i * PAGE_SIZE);
             }
         }
     }
-    
+    spinlock_release(&pmm_lock);
     return NULL;
 }
 
-/* Get number of free pages */
 size_t pmm_get_free_count(void) {
     return total_frames - used_frames;
 }
 
-/* Get number of used pages */
 size_t pmm_get_used_count(void) {
     return used_frames;
 }
-

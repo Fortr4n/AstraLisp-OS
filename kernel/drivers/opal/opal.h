@@ -15,6 +15,32 @@
 #define OPAL_CEC_REBOOT             6
 #define OPAL_POLL_EVENTS            10
 
+#define OPAL_CONFIG_CPU_IDLE_STATE  115
+#define OPAL_SLW_SET_REG            116
+#define OPAL_REGISTER_DUMP          117
+#define OPAL_PCI_SET_PHB_CAPI_MODE  118
+#define OPAL_PCI_GET_PHB_CAPI_MODE_INFO 119
+
+/* XIVE OPAL Tokens */
+#define OPAL_XIVE_RESET             128
+#define OPAL_XIVE_GET_IRQ_INFO      129
+#define OPAL_XIVE_GET_IRQ_CONFIG    130
+#define OPAL_XIVE_SET_IRQ_CONFIG    131
+#define OPAL_XIVE_GET_QUEUE_INFO    132
+#define OPAL_XIVE_SET_QUEUE_INFO    133
+#define OPAL_XIVE_DONATE_PAGE       134
+#define OPAL_XIVE_ALLOCATE_IRQ      135
+#define OPAL_XIVE_FREE_IRQ          136
+#define OPAL_XIVE_GET_VP_INFO       137
+#define OPAL_XIVE_SET_VP_INFO       138
+#define OPAL_XIVE_ALLOCATE_VP_BLOCK 139
+#define OPAL_XIVE_FREE_VP_BLOCK     140
+#define OPAL_XIVE_ALLOCATE_IRQ_TARGET 141
+#define OPAL_XIVE_FREE_IRQ_TARGET   142
+#define OPAL_XIVE_GET_PHB_IRQ_SPACE 143
+#define OPAL_XIVE_REGISTER_PHB      144
+#define OPAL_XIVE_SYNC              145
+
 /* Return Codes */
 #define OPAL_SUCCESS                0
 #define OPAL_PARAMETER              -1
