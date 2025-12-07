@@ -19,12 +19,8 @@ static inline bool is_env(lisp_value obj) {
     return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_ENV;
 }
 
-static inline bool is_builtin(lisp_value obj) {
-    return IS_POINTER(obj) && GET_TYPE(PTR_VAL(obj)) == TYPE_BUILTIN;
-}
-
 #define IS_ENV(x) is_env(x)
-#define IS_BUILTIN(x) is_builtin(x)
+/* IS_BUILTIN is now provided by types.h */
     
 /* Initialize evaluator */
 int evaluator_init(void) {
@@ -57,6 +53,23 @@ int evaluator_init(void) {
     lisp_register_builtin("/", builtin_divide);
     lisp_register_builtin("print", builtin_print);
     lisp_register_builtin("error", builtin_error);
+    
+#ifdef HAVE_THREADS
+    /* Threading builtins */
+    extern lisp_value builtin_spawn(lisp_value env, lisp_value args);
+    extern lisp_value builtin_join(lisp_value env, lisp_value args);
+    extern lisp_value builtin_thread_yield(lisp_value env, lisp_value args);
+    extern lisp_value builtin_current_thread(lisp_value env, lisp_value args);
+    extern lisp_value builtin_thread_state(lisp_value env, lisp_value args);
+    extern int thread_init(void);
+    
+    thread_init();
+    lisp_register_builtin("spawn", builtin_spawn);
+    lisp_register_builtin("join", builtin_join);
+    lisp_register_builtin("thread-yield", builtin_thread_yield);
+    lisp_register_builtin("current-thread", builtin_current_thread);
+    lisp_register_builtin("thread-state", builtin_thread_state);
+#endif
     
     /* Register T and NIL in global env */
     lisp_env_bind(global_env, lisp_intern("t"), LISP_T);

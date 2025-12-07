@@ -314,6 +314,12 @@ static void mark_roots(void) {
             }
         }
     }
+    
+    /* Mark all thread stacks (if threading enabled) */
+#ifdef HAVE_THREADS
+    extern void threads_mark_roots(void);
+    threads_mark_roots();
+#endif
 }
 
 /* ========== Sweeping ========== */

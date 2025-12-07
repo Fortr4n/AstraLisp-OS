@@ -23,7 +23,9 @@ typedef enum {
     TYPE_BIGNUM     = 6,
     TYPE_FLOAT      = 7,
     TYPE_ENV        = 8,
-    TYPE_BUILTIN    = 9
+    TYPE_BUILTIN    = 9,
+    TYPE_THREAD     = 10,
+    TYPE_VM_CLOSURE = 11   /* Bytecode VM closure */
 } heap_type_t;
 
 /* Common Object Header */
@@ -104,6 +106,13 @@ struct lisp_builtin {
     struct lisp_header header;
     lisp_builtin_fn fn;
     lisp_value name;      /* Symbol or String name */
+};
+
+/* Thread handle (wraps internal lisp_thread pointer) */
+struct lisp_thread_handle {
+    struct lisp_header header;
+    void* thread_ptr;     /* Pointer to struct lisp_thread */
+    uint64_t thread_id;   /* Thread ID for debugging */
 };
 
 /* Accessor Macros */
