@@ -1014,45 +1014,232 @@ struct btree {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `btree_init(struct btree* tree, uint32_t node_size, ...)` - Initialize tree
-2. `btree_insert(struct btree* tree, uint32_t key, uint64_t value)` - Insert key-value
-3. `btree_delete(struct btree* tree, uint32_t key)` - Delete key
-4. `btree_search(struct btree* tree, uint32_t key, uint64_t* value)` - Search key
-5. `btree_range_query(struct btree* tree, uint32_t start, uint32_t end, ...)` - Range query
-6. `btree_split_leaf(struct btree* tree, struct btree_node* node)` - Split leaf node
-7. `btree_split_internal(struct btree* tree, struct btree_node* node)` - Split internal node
-8. `btree_merge_leaf(struct btree* tree, struct btree_node* left, struct btree_node* right)` - Merge leaf nodes
-9. `btree_merge_internal(struct btree* tree, struct btree_node* left, struct btree_node* right)` - Merge internal nodes
-10. `btree_borrow_from_sibling(struct btree* tree, struct btree_node* node)` - Borrow from sibling
-11. `btree_rebalance(struct btree* tree, struct btree_node* node)` - Rebalance tree
-12. `btree_cache_get(struct btree* tree, uint32_t node_id)` - Get node from cache
-13. `btree_cache_put(struct btree* tree, struct btree_node* node)` - Put node in cache
-14. `btree_cache_evict(struct btree* tree)` - Evict least recently used node
-15. `btree_flush(struct btree* tree)` - Flush all dirty nodes to disk
+#### 1. `btree_init`
+
+```c
+int btree_init(struct btree* tree, uint32_t node_size, uint32_t key_size, uint32_t val_size);
+```
+
+**Description**:
+Initializes a new B+ Tree structure. accurate calculation of `max_keys` based on `node_size` and key/value sizes is critical here to ensure nodes fit within disk blocks.
+**Parameters**:
+
+- `tree`: Pointer to the `btree` structure to initialize.
+- `node_size`: Size of a tree node in bytes (typically 4096 to match page size).
+- `key_size`: Size of the key in bytes.
+- `val_size`: Size of the value in bytes (for leaf nodes).
+  **Returns**: `0` on success, or `-EINVAL` if sizes are invalid.
+  **Side Effects**: Allocates memory for the root node cache but does not write to disk until the first insert/flush.
+
+#### 2. `btree_insert`
+
+```c
+int btree_insert(struct btree* tree, uint32_t key, uint64_t value);
+```
+
+**Description**:
+Inserts a key-value pair into the B+ tree. This function handles the full "root-to-leaf" traversal, identifying the correct leaf node. If the leaf is full, it triggers a `btree_split_leaf` operation. If the split propagates up to the root, it creates a new root node, increasing tree height.
+**Parameters**:
+
+- `tree`: Active B+ Tree.
+- `key`: Unique 32-bit integer key (inode number).
+- `value`: 64-bit value (block pointer or struct offset).
+  **Returns**: `0` on success, `-EEXIST` if key exists, `-ENOMEM` if node allocation fails.
+
+#### 3. `btree_delete`
+
+```c
+int btree_delete(struct btree* tree, uint32_t key);
+```
+
+**Description**:
+Removes a key from the tree. If deletion causes a node to fall below `min_keys` (underflow), this function initiates rebalancing via `btree_borrow_from_sibling` or `btree_merge_leaf`.
+**Returns**: `0` on success, `-ENOENT` if key not found.
+
+#### 4. `btree_search`
+
+```c
+int btree_search(struct btree* tree, uint32_t key, uint64_t* value_out);
+```
+
+**Description**:
+Traverses the tree to find the value associated with `key`. Uses binary search within each internal node to find the child pointer, and binary search within the leaf node to find the exact key.
+**Performance**: O(log_m N) where m is branching factor.
+
+#### 5. `btree_range_query`
+
+```c
+int btree_range_query(struct btree* tree, uint32_t start_key, uint32_t end_key, uint64_t* results, size_t max_results);
+```
+
+**Description**:
+Finds the leaf node containing `start_key`, then traverses the linked list of leaf nodes (`next_leaf_id`) to collect all keys up to `end_key`.
+**Use Case**: Directory listings, extent lookups.
+
+#### 6. `btree_split_leaf`
+
+```c
+int btree_split_leaf(struct btree* tree, struct btree_node* node, struct btree_node** new_node_out);
+```
+
+**Description**:
+Splits a full leaf node into two.
+
+1. Allocates a new node `new_node`.
+2. Moves the upper 50% of keys/values from `node` to `new_node`.
+3. Updates linked list: `node->next` becomes `new_node`, `new_node->next` becomes old `node->next`.
+4. Helper Function returns the split key (first key of `new_node`) to be inserted into parent.
+
+#### 7. `btree_split_internal`
+
+```c
+int btree_split_internal(struct btree* tree, struct btree_node* node, struct btree_node** new_node_out, uint32_t* middle_key_out);
+```
+
+**Description**:
+Splits a full internal node.
+
+1. Allocates `new_node`.
+2. Moves upper 50% of keys and children to `new_node`.
+3. "Push up" the middle key (it is removed from the node and returned to be inserted in parent).
+4. Updates parent pointers.
+
+#### 8. `btree_merge_leaf`
+
+```c
+int btree_merge_leaf(struct btree* tree, struct btree_node* left, struct btree_node* right);
+```
+
+**Description**:
+Merges `right` node into `left` node when they are both underfull.
+
+1. Copies all keys/values from `right` to `left`.
+2. Updates `left->next` to `right->next`.
+3. Marks `right` node as free/deleted in the node allocator.
+4. Updates parent to remove the separator key.
+
+#### 9. `btree_merge_internal`
+
+```c
+int btree_merge_internal(struct btree* tree, struct btree_node* left, struct btree_node* right, uint32_t separator_key);
+```
+
+**Description**:
+Merges two internal nodes. Includes pulling down the `separator_key` from the parent into the merged node.
+
+#### 10. `btree_borrow_from_sibling`
+
+```c
+int btree_borrow_from_sibling(struct btree* tree, struct btree_node* node, struct btree_node* sibling, bool is_left_sibling);
+```
+
+**Description**:
+Moves one key (and corresponding child/value) from a wealthy sibling to an underflowing node to avoid merging. Updates the parent's separator key to reflect the new boundary.
+
+#### 11. `btree_rebalance`
+
+```c
+int btree_rebalance(struct btree* tree, struct btree_node* node);
+```
+
+**Description**:
+The master rebalancing logic. Checks if `node` is underfull. Looks at left and right siblings.
+
+- If `left` has spares -> `borrow_from_sibling(node, left)`.
+- If `right` has spares -> `borrow_from_sibling(node, right)`.
+- Else -> `merge_leaf` or `merge_internal` with available sibling.
+
+#### 12. `btree_cache_get`
+
+```c
+struct btree_node* btree_cache_get(struct btree* tree, uint32_t node_id);
+```
+
+**Description**:
+Check LRU cache for node. If miss, reads from disk via block device driver. If hit, moves to front of LRU list.
+
+#### 13. `btree_cache_put`
+
+```c
+void btree_cache_put(struct btree* tree, struct btree_node* node);
+```
+
+**Description**:
+Inserts a node into the cache. If cache is full, calls `btree_cache_evict`.
+
+#### 14. `btree_cache_evict`
+
+```c
+void btree_cache_evict(struct btree* tree);
+```
+
+**Description**:
+Finds least recently used node. If `dirty` flag is set, writes to disk. Then frees memory.
+
+#### 15. `btree_flush`
+
+```c
+int btree_flush(struct btree* tree);
+```
+
+**Description**:
+Iterates through all cache nodes. If `dirty`, writes them to disk. Used during `sync` or unmount.
 
 **B+ Tree Algorithms**:
 
-**Insert Algorithm**:
+**Detailed Algorithmic Specifications**:
 
-1. Find leaf node for key
-2. Insert key-value in sorted order
-3. If node overflows, split node
-4. Promote middle key to parent
-5. Recursively split parent if needed
-6. Create new root if root splits
+**Insert Algorithm (Iterative)**:
+
+1.  **Search Phase**:
+    - Start at `root_node`.
+    - While `node` is internal:
+      - Binary search keys to find index `i` such that `keys[i] <= key < keys[i+1]`.
+      - Push `node` and index `i` onto `traversal_stack` (for parent pointers).
+      - Fetch child node `child_ids[i]`. `node = child`.
+2.  **Leaf Phase**:
+    - Binary search in leaf `node` for insertion position.
+    - If key exists -> return Error.
+3.  **Insert/Split Phase**:
+    - If `node.key_count < max_keys`:
+      - Shift keys/values right.
+      - Insert new key/value.
+      - Mark `node` dirty.
+      - Return Success.
+    - Else (Leaf Full):
+      - Call `btree_split_leaf(node)`. Returns `new_node` and `split_key`.
+      - Propagate `split_key` up the stack.
+      - While stack not empty:
+        - Pop `parent`.
+        - If `parent` has space:
+          - Insert `split_key` and `new_node` pointer.
+          - Return.
+        - Else (Internal Node Full):
+          - Call `btree_split_internal(parent)`.
+          - Update `split_key` and `new_node` for next iteration.
+      - If stack empty (Root Split):
+        - Allocate `new_root`.
+        - `new_root` points to old `root` and `new_node`.
+        - Update `tree->root_id`.
 
 **Delete Algorithm**:
 
-1. Find leaf node containing key
-2. Delete key from leaf
-3. If node underflows:
-   - Try borrowing from sibling
-   - If can't borrow, merge with sibling
-   - Update parent (remove key, merge children)
-   - Recursively handle parent underflow
-4. Delete root if it becomes empty
+1.  **Search Phase**: Same as insert, track path in stack.
+2.  **Leaf Phase**:
+    - Remove key/value. Shift remaining left.
+    - If `key_count >= min_keys`: Return Success.
+    - Else (Underflow):
+      - Peek `parent` from stack.
+      - Identify left/right siblings using `parent` child pointers.
+      - Attempt `btree_borrow_from_sibling`. If success, Update `parent` key, Return.
+      - Attempt `btree_merge_leaf`. If success, remove separator from `parent`.
+      - Recursively handle `parent` underflow (propagate up).
+3.  **Collapsing Root**:
+    - If `root` is internal and has only 1 child:
+      - Make child the new root.
+      - Free old root.
 
 **Split Leaf Node**:
 
@@ -1152,54 +1339,171 @@ struct journal {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `journal_init(struct journal* journal, uint64_t log_start, uint64_t log_size)` - Initialize journal
-2. `journal_start_transaction(struct journal* journal, uint32_t* transaction_id)` - Start transaction
-3. `journal_log_entry(struct journal* journal, uint32_t transaction_id, enum journal_entry_type type, void* data, size_t size)` - Log entry
-4. `journal_commit_transaction(struct journal* journal, uint32_t transaction_id)` - Commit transaction
-5. `journal_abort_transaction(struct journal* journal, uint32_t transaction_id)` - Abort transaction
-6. `journal_checkpoint(struct journal* journal)` - Checkpoint journal
-7. `journal_recover(struct journal* journal)` - Recover from log
-8. `journal_rotate(struct journal* journal)` - Rotate log
-9. `journal_get_statistics(struct journal* journal, struct journal_stats* stats)` - Get statistics
+#### 1. `journal_init`
 
-**Journaling Algorithm**:
+```c
+int journal_init(struct journal* journal, uint64_t log_start_block, uint64_t log_size_blocks);
+```
 
-1. Before modifying filesystem, write log entry
-2. Write log entry to journal (with sequence number)
-3. Flush log to disk (fsync)
-4. Apply change to filesystem
-5. On commit, write commit entry
-6. Periodically checkpoint (write all committed changes to filesystem)
-7. Clear log entries after checkpoint
+**Description**:
+Initializes the write-ahead log system.
 
-**Recovery Algorithm**:
+1. Reads the log header from `log_start_block`.
+2. Validates the log signature and checksum.
+3. If header is invalid (fresh disk), initializes a new empty log.
+4. If header is valid, scans for the last written sequence number to enable append operations.
+   **Parameters**:
 
-1. Read journal from disk
-2. Find last checkpoint
-3. Replay all transactions after checkpoint
-4. Apply committed transactions
-5. Discard aborted transactions
-6. Update filesystem state
+- `journal`: Pointer to struct.
+- `log_start_block`: LBA where log partition begins.
+- `log_size_blocks`: Total size reserved for the log.
+  **Returns**: `0` on success, error code otherwise.
+
+#### 2. `journal_start_transaction`
+
+```c
+int journal_start_transaction(struct journal* journal, uint32_t* transaction_id_out);
+```
+
+**Description**:
+Starts a new atomic transaction.
+
+1. Acquires `journal_lock`.
+2. Increments `next_transaction_id`.
+3. Allocates a new `journal_transaction` structure.
+4. Adds to `active_transactions` list.
+   **Concurrency**: Thread-safe. Multiple transactions can be active (for non-conflicting ops).
+
+#### 3. `journal_log_entry`
+
+```c
+int journal_log_entry(struct journal* journal, uint32_t transaction_id, enum journal_entry_type type, void* data, size_t size);
+```
+
+**Description**:
+Writes an operation to the in-memory log buffer.
+
+1. Validates `transaction_id`.
+2. Marshals the data (opcode, target LBA, payload) into a `journal_entry` packet.
+3. Calculates CRC32 checksum for the entry.
+4. If log buffer full, triggers `journal_flush_buffer`.
+   **Performance**: Zero-copy if possible (using scatter-gather).
+
+#### 4. `journal_commit_transaction`
+
+```c
+int journal_commit_transaction(struct journal* journal, uint32_t transaction_id);
+```
+
+**Description**:
+Commits a transaction to durability.
+
+1. Changes transaction state to `COMMITTING`.
+2. Writes a `JOURNAL_ENTRY_COMMIT` record to the log buffer.
+3. Forces a disk flush (fsync) of the log area.
+4. Updates in-memory state to `COMMITTED`.
+5. Signals any threads waiting on this transaction.
+
+#### 5. `journal_abort_transaction`
+
+```c
+int journal_abort_transaction(struct journal* journal, uint32_t transaction_id);
+```
+
+**Description**:
+Rolls back an active transaction.
+
+1. Logs a `JOURNAL_ENTRY_ABORT` record (for debugging/audit, strictly optional for correctness as uncommitted txns are ignored on recovery).
+2. Discards any in-memory dirty pages associated with this transaction.
+3. Frees transaction resources.
+
+#### 6. `journal_checkpoint`
+
+```c
+int journal_checkpoint(struct journal* journal);
+```
+
+**Description**:
+Truncates the log by applying committed changes to the main filesystem.
+
+1. Iterates through `completed_transactions` from oldest to newest.
+2. For each modified block, writes the data to its final LBA in the main FS partition.
+3. Updates the `log_start_ptr` in the on-disk log header.
+4. Discards freed log blocks.
+
+#### 7. `journal_recover`
+
+```c
+int journal_recover(struct journal* journal);
+```
+
+**Description**:
+Replays the log after an unclean shutdown.
+
+1. Reads log from `last_checkpoint`.
+2. Scans forward, verifying checksums of all entries.
+3. Builds a map of `transaction_id` -> `state` (Checking for COMMIT records).
+4. Replays only operations belonging to COMMITTED transactions.
+5. Ignores partial or uncommitted transactions.
+
+#### 8. `journal_rotate`
+
+```c
+int journal_rotate(struct journal* journal);
+```
+
+**Description**:
+Handles circular buffer wrap-around. If the log write pointer nears the end of the log area, this function triggers a forced checkpoint to free up space at the beginning.
+
+#### 9. `journal_get_statistics`
+
+```c
+int journal_get_statistics(struct journal* journal, struct journal_stats* stats);
+```
+
+**Description**:
+Returns telemetry: operations per second, average commit latency, log usage percentage.
+
+**Journaling Algorithms (Write-Ahead Log)**:
+
+**Standard Logging Flow**:
+
+1.  **Prepare**: App creates a transaction `TxID`.
+2.  **Log**:
+    - For every metadata change (inode update, bitmap flip):
+    - Create `ENTRY(TxID, LBA, OldData, NewData)`.
+    - Append to `LogBuffer`.
+3.  **Commit**:
+    - App calls commit.
+    - System creates `COMMIT(TxID)` entry.
+    - **BARRIER**: Disk Cache Flush.
+    - Write `LogBuffer` to Log Partition.
+    - **BARRIER**: Disk Cache Flush.
+    - Transaction is now Durable.
+4.  **Apply (Async)**:
+    - Background thread writes `NewData` to Main FS LBA.
+    - On completion, advanced Log Head pointer.
+
+**Recovery Algorithm (ARIES-style)**:
+
+1.  **Analysis Phase**:
+    - Scan log from last checkpoint to end.
+    - If `ENTRY` found -> Add to "Dirty Pages Table".
+    - If `COMMIT` found -> Add TxID to "Winner Set".
+    - If `ABORT` found or End-of-Log without Commit -> Add TxID to "Loser Set".
+2.  **Redo Phase**:
+    - Replay ALL updates from "Winner Set" in order.
+    - Update disk blocks to match logged `NewData`.
+3.  **Undo Phase**:
+    - (Optional, if using Undo/Redo login). For LFSX (Redo-only), simple discard of "Loser Set" is sufficient since modifications aren't applied to main FS until checkpoint.
 
 **Error Handling**:
 
-- Handle log full condition
-- Handle disk I/O errors
-- Handle corrupted log entries
-- Recover from partial writes
-- Validate log integrity
-
-**Testing Requirements**:
-
-- Test transaction logging
-- Test commit/abort
-- Test checkpointing
-- Test crash recovery
-- Test log rotation
-- Test concurrent transactions
-- Test error recovery
+- **Log Full**: Block new transactions until Checkpoint completes.
+- **Checksum Mismatch**: Truncate log at point of failure (assume power loss during write). Treat remainder as invalid.
+- **Write Failure**: Mark filesystem read-only immediately (panic).
 
 ---
 
@@ -1271,57 +1575,127 @@ struct version {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `transaction_begin(enum isolation_level level, uint32_t* transaction_id)` - Begin transaction
-2. `transaction_commit(uint32_t transaction_id)` - Commit transaction
-3. `transaction_abort(uint32_t transaction_id)` - Abort transaction
-4. `transaction_read(uint32_t transaction_id, uint32_t key, void* value, size_t size)` - Read with isolation
-5. `transaction_write(uint32_t transaction_id, uint32_t key, const void* value, size_t size)` - Write
-6. `transaction_create_version(uint32_t transaction_id, uint32_t key, void* data)` - Create version
-7. `transaction_get_version(uint32_t transaction_id, uint32_t key, uint64_t version_id, void* value)` - Get specific version
-8. `transaction_detect_deadlock(void)` - Detect deadlocks
-9. `transaction_resolve_deadlock(struct transaction* victim)` - Resolve deadlock
-10. `transaction_set_savepoint(uint32_t transaction_id, uint32_t* savepoint_id)` - Set savepoint
-11. `transaction_rollback_to_savepoint(uint32_t transaction_id, uint32_t savepoint_id)` - Rollback to savepoint
+#### 1. `transaction_begin`
 
-**MVCC Algorithm**:
+```c
+int transaction_begin(enum isolation_level level, uint32_t* transaction_id_out);
+```
 
-1. On write, create new version with transaction ID
-2. On read, find appropriate version based on isolation level
-3. For read committed: read latest committed version
-4. For repeatable read: read version from transaction snapshot
-5. For serializable: use strict two-phase locking
-6. Mark versions for deletion on commit
-7. Garbage collect old versions
+**Description**:
+Initiates a defined scope for atomic operations.
 
-**Deadlock Detection**:
+1. allocates new `trx` struct.
+2. sets `start_ts` to global monotonic clock.
+3. If `level == SERIALIZABLE`, acquires global shared lock (or range locks).
+   **Returns**: Transaction ID handle.
 
-1. Build wait-for graph
-2. Detect cycles in graph
-3. Select victim transaction (youngest, least work)
-4. Abort victim transaction
-5. Release victim's locks
-6. Retry waiting transactions
+#### 2. `transaction_commit`
+
+```c
+int transaction_commit(uint32_t transaction_id);
+```
+
+**Description**:
+Finalizes the transaction.
+
+1. **Validation Phase** (for SSI/Snapshot isolation): Checks if read set overlaps with any concurrent committed write sets.
+2. If validation fails -> `transaction_abort` -> return `-ECONFLICT`.
+3. If success, calls `journal_commit_transaction`.
+4. Updates global `last_committed_ts`.
+5. Releases all locks.
+
+#### 3. `transaction_abort`
+
+```c
+int transaction_abort(uint32_t transaction_id);
+```
+
+**Description**:
+Reverts all changes.
+
+1. Walks `changes` list.
+2. Restores old values in memory (or simply discards new versions in MVCC).
+3. Releases all locks.
+4. Marks transaction object as `ABORTED`.
+
+#### 4. `transaction_read`
+
+```c
+int transaction_read(uint32_t transaction_id, uint32_t key, void* value_out, size_t size);
+```
+
+**Description**:
+Reads data respecting isolation level.
+
+- **READ_COMMITTED**: Reads latest version where `commit_ts <= current_ts`.
+- **REPEATABLE_READ**: Reads version where `commit_ts <= trx.start_ts`.
+- **SERIALIZABLE**: Reads latest + Acquires Shared Lock on `key`.
+
+#### 5. `transaction_write`
+
+```c
+int transaction_write(uint32_t transaction_id, uint32_t key, const void* value, size_t size);
+```
+
+**Description**:
+Writes data.
+
+1. Acquires Exclusive Lock on `key`. If busy, wait or deadlock check.
+2. Creates a new version of the data object.
+3. Tag with `transaction_id`.
+4. Append to `trx.changes` list.
+
+#### 6. `transaction_detect_deadlock`
+
+```c
+int transaction_detect_deadlock(void);
+```
+
+**Description**:
+Runs periodically or on lock contention.
+
+1. Constructs "Waits-For" Directed Graph using lock queues.
+2. Uses DFS (Depth First Search) to find cycles.
+3. If cycle A->B->A is found:
+   - Selects victim (usually valid B).
+   - Calls `transaction_abort(B)`.
+   - Wake up A.
+
+**MVCC Implementation Details**:
+
+1.  **Version Storage**:
+    - Each data page/object has a linked list of versions.
+    - `Head -> [Ver3 (Active, Tx105)] -> [Ver2 (Committed, Ts=50)] -> [Ver1 (Committed, Ts=40)]`.
+2.  **Visibility Rules (Snapshot Isolation)**:
+    - Tx110 starts at Ts=60.
+    - It sees Ver2 (because 50 <= 60).
+    - It ignores Ver3 (Tx105 not committed or committed after 60).
+3.  **Garbage Collection (Vacuum)**:
+    - Background thread tracks "Oldest Active Transaction Start Timestamp" (MinStartTs).
+    - Any version with `EndTs < MinStartTs` is unreachable by any active transaction.
+    - It can be physically deleted.
+
+**Deadlock Detection Algorithm**:
+
+1.  **State**: Global `WaitGraph` G = (V, E).
+2.  **Event**: Tx1 wants lock L held by Tx2.
+    - Add Edge Tx1 -> Tx2.
+    - Run `DetectCycle(Tx1)`.
+3.  **DetectCycle(Node N)**:
+    - Stack = [N]. Visited = {N}.
+    - DFS traversal.
+    - If edge points to node in Stack -> CYCLE DETECTED.
+4.  **Resolution**:
+    - Pick transaction with fewer locks/log-entries as victim.
+    - Abort victim. Return error to caller.
 
 **Error Handling**:
 
-- Handle deadlock detection
-- Handle transaction timeout
-- Handle isolation violations
-- Handle rollback failures
-- Validate transaction state
-
-**Testing Requirements**:
-
-- Test ACID properties
-- Test isolation levels
-- Test MVCC
-- Test deadlock detection
-- Test rollback
-- Test nested transactions
-- Test concurrent transactions
-- Test error recovery
+- **Lock Timeout**: If lock wait > 5s, auto-abort.
+- **Validation Failure**: Optimistic concurrency control failure (Write skew). return Error.
+- **Chain Logic**: If nested parent aborts, all children abort.
 
 ---
 
@@ -1462,58 +1836,158 @@ struct sk_buff {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `netdev_alloc(const char* name, size_t priv_size)` - Allocate network device
-2. `netdev_register(struct net_device* dev)` - Register device with stack
-3. `netdev_unregister(struct net_device* dev)` - Unregister device
-4. `netdev_open(struct net_device* dev)` - Open device (bring up)
-5. `netdev_close(struct net_device* dev)` - Close device (bring down)
-6. `netdev_xmit(struct sk_buff* skb)` - Transmit packet
-7. `netdev_rx(struct net_device* dev, struct sk_buff* skb)` - Receive packet
-8. `netdev_alloc_skb(struct net_device* dev, uint32_t size)` - Allocate SKB
-9. `netdev_free_skb(struct sk_buff* skb)` - Free SKB
-10. `ring_buffer_init(struct net_ring* ring, uint32_t size, uint32_t desc_size)` - Init ring
-11. `ring_buffer_alloc_entry(struct net_ring* ring)` - Allocate ring entry
-12. `ring_buffer_free_entry(struct net_ring* ring, uint32_t index)` - Free entry
-13. `netdev_poll(struct net_device* dev)` - Poll for packets (NAPI)
-14. `netdev_set_link(struct net_device* dev, bool up, uint32_t speed, bool duplex)` - Set link state
+#### 1. `netdev_alloc`
 
-**DMA Management**:
+```c
+struct net_device* netdev_alloc(const char* name, size_t priv_size);
+```
 
-- Allocate physically contiguous memory for ring buffers
-- Set up DMA descriptors with proper alignment
-- Handle DMA coherency (cache flush/invalidate)
-- Map/unmap DMA buffers for each transfer
-- Handle scatter-gather lists for large packets
+**Description**:
+Allocates a new `net_device` structure and associated private data.
 
-**Interrupt Handling**:
+1. Allocates `sizeof(struct net_device) + priv_size` from kernel heap (zeroed).
+2. Sets `priv` pointer to the end of the `net_device` struct.
+3. Initializes spinlocks (`tx_lock`, `rx_lock`).
+4. Sets default name (e.g., "eth%d").
+   **Parameters**:
 
-- Register interrupt handler with kernel
-- Handle TX completion interrupts
-- Handle RX ready interrupts
-- Handle link status change interrupts
-- Handle error interrupts (underrun, overrun)
-- Implement interrupt coalescing
+- `name`: Name template (e.g., "eth%d").
+- `priv_size`: Size of driver-specific private data.
+
+#### 2. `netdev_register`
+
+```c
+int netdev_register(struct net_device* dev);
+```
+
+**Description**:
+Registers the device with the core network stack.
+
+1. Assigns a unique interface index (ifindex).
+2. Resolves the name template (e.g., "eth0").
+3. Inserts into the global `net_device_list`.
+4. Exposes the device to userspace (via sysfs equivalent).
+5. Triggers a `NETDEV_REGISTER` event to listeners (DHCP client, etc.).
+
+#### 3. `netdev_open`
+
+```c
+int netdev_open(struct net_device* dev);
+```
+
+**Description**:
+Brings the interface UP.
+
+1. Calls driver's `ops->open()`.
+2. Allocates RX ring buffers if dynamic.
+3. Enables hardware interrupts.
+4. Sets `IFF_UP` flag.
+5. Starts the TX queue.
+
+#### 4. `netdev_xmit`
+
+```c
+int netdev_xmit(struct sk_buff* skb, struct net_device* dev);
+```
+
+**Description**:
+Transmits a packet.
+
+1. Acquires `tx_lock`.
+2. Checks if TX queue is stopped (flow control).
+3. Calls driver's `ops->start_xmit(skb, dev)`.
+4. If driver returns `NETDEV_TX_BUSY`:
+   - Requeues packet.
+   - Stops queue.
+   - Returns status.
+5. Updates `tx_packets` and `tx_bytes` stats.
+
+#### 5. `netdev_rx`
+
+```c
+int netdev_rx(struct net_device* dev, struct sk_buff* skb);
+```
+
+**Description**:
+Called by driver interrupt handler to push received packet up the stack.
+
+1. Sets `skb->dev`.
+2. Identifies protocol (`eth_type_trans`).
+3. If NAPI enabled, queues to softirq backlog.
+4. Otherwise, calls `netif_receive_skb(skb)` immediately to pass to IP stack.
+
+#### 6. `ring_buffer_init`
+
+```c
+int ring_buffer_init(struct net_ring* ring, uint32_t size, uint32_t desc_size);
+```
+
+**Description**:
+Initializes a circular DMA ring buffer.
+
+1. Allocates physically contiguous memory for descriptors (`dma_alloc_coherent`).
+2. Allocates `sk_buff*` array for software management.
+3. Resets head/tail indices.
+
+#### 7. `netdev_poll` (NAPI)
+
+```c
+int netdev_poll(struct net_device* dev, int budget);
+```
+
+**Description**:
+Polled in softirq context to process RX packets.
+
+1. Reads up to `budget` packets from RX ring.
+2. For each packet: `netif_receive_skb`.
+3. Refills RX ring with new buffers.
+4. If work done < budget:
+   - Re-enables interrupts.
+   - Removes self from poll list.
+   - Returns work done.
+
+**Detailed Algorithmic Specifications**:
+
+**DMA Management Algorithm**:
+
+1.  **Setup**:
+    - Driver requests `pci_alloc_consistent` for descriptor rings.
+    - Writes physical address base to NIC `TDBA/RDBA` registers.
+2.  **TX Flow**:
+    - Driver gets `skb->data` physical address (`dma_map_single`).
+    - Writes address and length to current TX Descriptor.
+    - Sets "End of Packet" bit.
+    - Increments Tail index (Modulo RingSize).
+    - Writes Tail to NIC `TDT` (Tail Descriptor Tail) register to trigger DMA.
+3.  **RX Flow**:
+    - Driver pre-allocates empty `skb`s.
+    - Maps them and fills RX Descriptors.
+    - Hardware DMAs packet data -> memory.
+    - Hardware updates Head index (or write-back descriptor status).
+
+**Interrupt Handling Logic**:
+
+1.  **Hardware Interrupt**:
+    - CPU jumps to ISR.
+    - Masks interrupts on NIC.
+    - Reads `ICR` (Interrupt Cause Register).
+2.  **Dispatch**:
+    - If `ICR & TX_DONE`: Clean transmitted buffers. Wake queue if stopped.
+    - If `ICR & RX_READY`:
+      - (Legacy) Read packet, pass to stack.
+      - (NAPI) Disable RX IRQ, schedule SOFTIRQ, return.
+    - If `ICR & LINK_CHANGE`: Check PHY status, update flags.
+3.  **NAPI SoftIRQ**:
+    - Runs `netdev_poll`.
+    - If RX ring empty, re-enable RX IRQ.
 
 **Error Handling**:
 
-- Handle TX timeout (queue stuck)
-- Handle RX overflow (drop packets)
-- Handle link down (pause TX)
-- Handle DMA errors (reset device)
-- Handle out-of-memory (drop packets gracefully)
-
-**Testing Requirements**:
-
-- Test device registration/unregistration
-- Test packet transmission
-- Test packet reception
-- Test ring buffer management
-- Test interrupt handling
-- Test link state changes
-- Test error recovery
-- Test performance under load
+- **TX Timeout**: Watchdog timer fires if TX Queue active but no completion for 5s. Resets NIC hardware.
+- **RX Overflow**: Increase RingIO size or drop packets. Increment `rx_dropped` counter.
+- **DMA Error**: Detecting PCI bus error -> Full device reset.
 
 ---
 
@@ -1865,58 +2339,121 @@ struct ip_stats {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `ip_init(void)` - Initialize IP stack
-2. `ip_rcv(struct sk_buff* skb, struct net_device* dev)` - Receive IP packet
-3. `ip_send(struct sk_buff* skb, uint32_t dest, uint8_t protocol)` - Send IP packet
-4. `ip_forward(struct sk_buff* skb)` - Forward IP packet
-5. `ip_route_input(struct sk_buff* skb)` - Route input
-6. `ip_route_output(uint32_t dest, uint32_t src, struct route_entry** rt)` - Find route
-7. `ip_fragment(struct sk_buff* skb, uint32_t mtu)` - Fragment packet
-8. `ip_defragment(struct sk_buff* skb)` - Reassemble fragments
-9. `ip_options_parse(struct sk_buff* skb, struct ip_options* opts)` - Parse options
-10. `ip_checksum(void* data, size_t length)` - Compute checksum
-11. `ip_verify_checksum(struct ipv4_header* hdr)` - Verify checksum
-12. `route_add(uint32_t dest, uint32_t mask, uint32_t gateway, struct net_device* dev)` - Add route
-13. `route_del(uint32_t dest, uint32_t mask)` - Delete route
-14. `route_lookup(uint32_t dest)` - Lookup route
-15. `route_cache_flush(void)` - Flush route cache
+#### 1. `ip_send`
 
-**IP Receive Processing**:
+```c
+int ip_send(struct sk_buff* skb, uint32_t dest, uint8_t protocol);
+```
 
-1. Validate IP version (must be 4)
-2. Verify header length (>= 20 bytes)
-3. Verify total length <= packet length
-4. Verify header checksum
-5. Check destination address
-6. If for us: pass to transport layer
-7. If not for us: forward (if routing enabled)
-8. Handle options if present
-9. If fragment: pass to reassembly
-10. Update statistics
+**Description**:
+Prepares and transmits an IP packet.
 
-**IP Fragmentation Algorithm**:
+1. Allocates SKB head room for IP Header.
+2. Performs Route Lookup (`ip_route_output`) to find outgoing interface and next-hop gateway.
+3. Fills IPv4 Header (Version=4, IHL=5, TTL=64, ID=AtomicInc).
+4. Calculates Header Checksum.
+5. If packet length > MTU: calls `ip_fragment`.
+6. Passes to `netdev_xmit`.
 
-1. Check if packet > MTU
-2. If DF flag set: return error
-3. Calculate fragment size (multiple of 8)
-4. Split packet into fragments
-5. Set fragment offset and MF flag
-6. Copy IP header to each fragment
-7. Recalculate checksum for each fragment
-8. Queue fragments for transmission
+#### 2. `ip_rcv`
 
-**IP Reassembly Algorithm**:
+```c
+int ip_rcv(struct sk_buff* skb, struct net_device* dev);
+```
 
-1. Check if packet is a fragment
-2. Look up reassembly queue by (src, dst, id, protocol)
-3. If not found: create new queue
-4. Insert fragment in order
-5. Check for overlapping fragments (security)
-6. If all fragments received: reassemble
-7. Timeout incomplete reassembly (60 seconds)
-8. Return complete packet or continue waiting
+**Description**:
+Main IP receive hook.
+
+1. Validates checksum, version, and length.
+2. Checks Pre-Routing Netfilter hooks.
+3. If dest == local_addr: Passes to `ip_local_deliver`.
+4. If dest != local_addr and forwarding enabled: Passes to `ip_forward`.
+5. If fragment (MF bit set or Offset > 0): buffer in reassembly queue.
+
+#### 3. `ip_fragment`
+
+```c
+int ip_fragment(struct sk_buff* skb, uint32_t mtu);
+```
+
+**Description**:
+Splits a large packet into MTU-sized chunks.
+
+1. Calculates number of fragments needed.
+2. For each fragment:
+   - Allocates new SKB.
+   - Copies IP header.
+   - Copies data slice.
+   - Sets Fragment Offset field.
+   - Sets MF (More Fragments) bit (except last).
+   - Recalculates Checksum.
+3. Queues all fragments for transmission.
+
+#### 4. `ip_route_output`
+
+```c
+int ip_route_output(uint32_t dest, uint32_t src, struct route_entry** rt);
+```
+
+**Description**:
+Finds the best path to destination.
+
+1. Scans `routing_table` for longest prefix match (LPM) against `dest`.
+2. Validates cache entries (expiration).
+3. If no match found, returns `-ENETUNREACH` or uses Default Gateway.
+4. Returns route entry containing outgoing device and next hop.
+
+#### 5. `ip_defragment`
+
+```c
+struct sk_buff* ip_defragment(struct sk_buff* skb);
+```
+
+**Description**:
+Reassembles fragments into a full packet.
+
+1. Hashes (Src, Dst, ID, Proto) to find reassembly queue (`ipq`).
+2. Inserts current fragment into sorted linked list (by offset).
+3. Checks for overlapping fragments (Teardrop attack protection).
+4. If all hole descriptors are filled:
+   - Allocates large SKB.
+   - Copies data from all fragments.
+   - Returns full packet.
+   - Frees fragment SKBs.
+5. Otherwise, returns NULL (waiting for more).
+
+#### 6. `route_add` / `route_del`
+
+```c
+int route_add(uint32_t dest, uint32_t mask, uint32_t gateway, struct net_device* dev);
+int route_del(uint32_t dest, uint32_t mask);
+```
+
+**Description**:
+Manipulates the generic routing table (FIB - Forwarding Information Base).
+
+**Detailed Algorithmic Specifications**:
+
+**IP Forwarding Algorithm**:
+
+1.  **TTL Check**: Decrement TTL. If 0, drop and send ICMP Time Exceeded.
+2.  **Lookup**: `ip_route_lookup(packet.dst)`.
+3.  **Redirect**: If next-hop is on same subnet as source, send ICMP Redirect.
+4.  **MTU Check**: If len > route.mtu:
+    - If DF (Don't Fragment) set: Drop, send ICMP Frag Needed (Path MTU Discovery).
+    - Else: `ip_fragment()`.
+5.  **Output**: `netdev_xmit(packet, route.dev)`.
+
+**Reassembly Timeout Logic**:
+
+- Global Timer runs every 1 second.
+- Scans all active Reassembly Queues.
+- If `(current_time - q.creation_time) > IP_FRAG_TIME (60s)`:
+  - Drop all fragments in queue.
+  - Send ICMP Time Exceeded to sender (if 1st fragment was received).
+  - Free Queue.
 
 ---
 
@@ -2044,84 +2581,155 @@ struct tcp_sock {
 #define TCP_FLAG_URG    0x20
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `tcp_init(void)` - Initialize TCP
-2. `tcp_rcv(struct sk_buff* skb)` - Receive TCP segment
-3. `tcp_transmit_skb(struct tcp_sock* sk, struct sk_buff* skb, bool clone)` - Transmit
-4. `tcp_send_syn(struct tcp_sock* sk)` - Send SYN
-5. `tcp_send_synack(struct tcp_sock* sk)` - Send SYN-ACK
-6. `tcp_send_ack(struct tcp_sock* sk)` - Send ACK
-7. `tcp_send_fin(struct tcp_sock* sk)` - Send FIN
-8. `tcp_send_rst(struct tcp_sock* sk)` - Send RST
-9. `tcp_connect(struct tcp_sock* sk, uint32_t addr, uint16_t port)` - Active open
-10. `tcp_listen(struct tcp_sock* sk, int backlog)` - Passive open
-11. `tcp_accept(struct tcp_sock* sk, struct tcp_sock** newsk)` - Accept connection
-12. `tcp_close(struct tcp_sock* sk)` - Close connection
-13. `tcp_sendmsg(struct tcp_sock* sk, void* data, size_t len)` - Send data
-14. `tcp_recvmsg(struct tcp_sock* sk, void* buf, size_t len)` - Receive data
-15. `tcp_retransmit(struct tcp_sock* sk)` - Retransmit unacked
-16. `tcp_fast_retransmit(struct tcp_sock* sk)` - Fast retransmit
-17. `tcp_congestion_control(struct tcp_sock* sk, bool loss)` - Adjust cwnd
-18. `tcp_parse_options(struct sk_buff* skb, struct tcp_options* opts)` - Parse options
-19. `tcp_checksum(struct sk_buff* skb)` - Compute checksum
-20. `tcp_state_machine(struct tcp_sock* sk, struct sk_buff* skb)` - Process state
+#### 1. `tcp_connect`
 
-**TCP State Machine**:
-
-```
-State transitions:
-
-CLOSED:
-  - connect() -> send SYN, go to SYN_SENT
-  - listen() -> go to LISTEN
-
-LISTEN:
-  - recv SYN -> send SYN-ACK, go to SYN_RECEIVED
-  - close() -> go to CLOSED
-
-SYN_SENT:
-  - recv SYN-ACK -> send ACK, go to ESTABLISHED
-  - recv SYN -> send SYN-ACK, go to SYN_RECEIVED (simultaneous open)
-  - timeout -> retransmit SYN or go to CLOSED
-
-SYN_RECEIVED:
-  - recv ACK -> go to ESTABLISHED
-  - recv RST -> go to LISTEN or CLOSED
-  - close() -> send FIN, go to FIN_WAIT_1
-
-ESTABLISHED:
-  - recv FIN -> send ACK, go to CLOSE_WAIT
-  - close() -> send FIN, go to FIN_WAIT_1
-
-FIN_WAIT_1:
-  - recv ACK -> go to FIN_WAIT_2
-  - recv FIN -> send ACK, go to CLOSING
-  - recv FIN-ACK -> send ACK, go to TIME_WAIT
-
-FIN_WAIT_2:
-  - recv FIN -> send ACK, go to TIME_WAIT
-
-CLOSING:
-  - recv ACK -> go to TIME_WAIT
-
-CLOSE_WAIT:
-  - close() -> send FIN, go to LAST_ACK
-
-LAST_ACK:
-  - recv ACK -> go to CLOSED
-
-TIME_WAIT:
-  - 2*MSL timeout -> go to CLOSED
+```c
+int tcp_connect(struct tcp_sock* sk, uint32_t addr, uint16_t port);
 ```
 
-**Congestion Control (Reno)**:
+**Description**:
+Performs "Active Open".
 
-1. **Slow Start**: cwnd starts at 1 MSS, doubles each RTT
-2. **Congestion Avoidance**: cwnd increases by 1 MSS per RTT
-3. **Fast Retransmit**: On 3 duplicate ACKs, retransmit immediately
-4. **Fast Recovery**: ssthresh = cwnd/2, cwnd = ssthresh + 3 MSS
-5. **Timeout**: ssthresh = cwnd/2, cwnd = 1 MSS, start slow start
+1. Selects ephemeral local port if not bound.
+2. Initializes Sequence Number (`iss` = SecureRandom).
+3. Sets state `TCP_SYN_SENT`.
+4. Constructs SYN packet (SEQ=ISS).
+5. Starts Retransmission Timer.
+6. Calls `ip_send`.
+
+#### 2. `tcp_listen`
+
+```c
+int tcp_listen(struct tcp_sock* sk, int backlog);
+```
+
+**Description**:
+Performs "Passive Open".
+
+1. Allocates accept queue and SYN queue (half-open).
+2. Sets state `TCP_LISTEN`.
+3. Registers socket in global Listening Hash Table.
+
+#### 3. `tcp_rcv`
+
+```c
+int tcp_rcv(struct sk_buff* skb);
+```
+
+**Description**:
+Main TCP Input Engine.
+
+1. Validates Checksum.
+2. Finds socket using tuple (SrcIP, DstIP, SrcPort, DstPort).
+3. Locks socket.
+4. Calls `tcp_state_machine`.
+
+#### 4. `tcp_sendmsg`
+
+```c
+int tcp_sendmsg(struct tcp_sock* sk, void* data, size_t len);
+```
+
+**Description**:
+Queues data for transmission.
+
+1. Breaks data into MSS-sized chunks.
+2. Appends to `send_queue`.
+3. If Nagle Algorithm permits and CWND allows:
+   - Calls `tcp_transmit_skb`.
+4. Otherwise, waits for ACK or Window Update.
+
+**Detailed TCP State Machine & Logic**:
+
+**1. CLOSED State**:
+
+- Packet In: If RST, ignore. If ACK, send RST. If SYN, ignore (or RST).
+- Event `connect()`: Send SYN, `snd_nxt`++, enter `SYN_SENT`.
+
+**2. LISTEN State**:
+
+- Packet In (SYN):
+  - Create `request_sock` (mini-socket).
+  - Send SYN-ACK (SEQ=ISS, ACK=RCV.SEQ+1).
+  - Add to SYN Queue.
+- Packet In (ACK):
+  - Check SYN Queue. If match found:
+  - Create full `tcp_sock`.
+  - Move from SYN Queue to Accept Queue.
+  - Wake up `accept()`.
+  - Enter `ESTABLISHED`.
+
+**3. SYN_SENT State**:
+
+- Packet In (SYN-ACK):
+  - Check Ack matches `snd_nxt`.
+  - Send ACK.
+  - Initialize Congestion Control (`cwnd=MSS`).
+  - Enter `ESTABLISHED`.
+- Packet In (SYN): Simultaneous Open. Send SYN-ACK, Enter `SYN_RCVD`.
+
+**4. ESTABLISHED State**:
+
+- **Data Receiver**:
+  - Check Sequence Number (must be in window).
+  - If expected (`seq == rcv_nxt`):
+    - Copy to Receive Buffer.
+    - `rcv_nxt += len`.
+    - Send Delayed ACK (or immediate if "quickack" mode).
+  - If gap (`seq > rcv_nxt`):
+    - Queue in Out-Of-Order (OOO) queue.
+    - Send SACK (Selective ACK) if negotiated.
+    - Send Duplicate ACK (Trigger Fast Retransmit on sender).
+- **Data Sender (on ACK)**:
+  - Slow Start: `cwnd += MSS` (Exponential).
+  - Congestion Avoidance: `cwnd += MSS*MSS/cwnd` (Linear).
+  - Remove ACKed segments from `retransmit_queue`.
+  - Reset Retransmission Timer.
+
+**5. FIN Processing (Active Close)**:
+
+- App calls `close()`.
+- Send FIN. `snd_nxt`++.
+- Enter `FIN_WAIT_1`.
+- Receive ACK of FIN: Enter `FIN_WAIT_2`.
+- Receive FIN from peer: Send ACK. Enter `TIME_WAIT`.
+
+**6. FIN Processing (Passive Close)**:
+
+- Receive FIN in `ESTABLISHED`.
+- Send ACK. `rcv_nxt`++.
+- Wake up App with EOF.
+- Enter `CLOSE_WAIT`.
+- App calls `close()`.
+- Send FIN. Enter `LAST_ACK`.
+- Receive ACK of FIN: Enter `CLOSED`.
+
+**Congestion Control Algorithms (CUBIC/Reno)**:
+
+**Fast Retransmit**:
+
+- Trigger: Receive 3 Duplicate ACKs.
+- Action: Retransmit oldest unacked segment IMMEDIATELY (bypass timer).
+- Set `ssthresh = cwnd / 2`.
+- Set `cwnd = ssthresh + 3*MSS`. (Fast Recovery).
+
+**Retransmission Timeout (RTO)**:
+
+- Trigger: Timer expires before ACK.
+- Action:
+  - Retransmit oldest segment.
+  - Set `ssthresh = cwnd / 2`.
+  - Set `cwnd = 1 MSS` (Reset to Slow Start).
+  - Backoff RTO (Exponential backoff 2x, 4x...).
+
+**Round Trip Time (RTT) Estimation**:
+
+- Measure `MRTT` (sample RTT).
+- `SRTT` (Smoothed) = 0.875 _ SRTT + 0.125 _ MRTT
+- `RTTVAR` (Variance) = 0.75 _ RTTVAR + 0.25 _ |SRTT - MRTT|
+- `RTO` = SRTT + 4 \* RTTVAR.
 
 **Retransmission Timer**:
 
@@ -4569,10 +5177,425 @@ if (syscall_name(arg1, arg2) < 0) {
 
 related_syscall(2), related_function(3)
 
-```
+````
 
 ---
 
 *Document continues with Phases 10-12...*
+
+## Phase 10: Advanced OS Features (Months 25-28)
+
+### Timeline Overview
+
+| Week  | Milestone              | Deliverables              |
+| ----- | ---------------------- | ------------------------- |
+| 1-4   | SMP Support            | Multi-core boot, per-CPU  |
+| 5-8   | Advanced Scheduler     | Load balancing, affinity  |
+| 9-12  | Virtualization         | VT-x/SVM enabled VMM      |
+| 13-16 | Real-time Extensions   | Preemption, PI mutexes    |
+
+### 10.1 Symmetric Multiprocessing (SMP) - Complete Implementation
+
+#### Requirements
+
+- **Multi-core Boot**: Wake up Application Processors (APs)
+- **Per-CPU Data**: CPU-local storage
+- **Locking**: Spinlocks, Reader-Writer locks, RCU
+- **IPI**: Inter-Processor Interrupts
+- **TLB Shootdown**: Coordinated TLB invalidation
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* Per-CPU data area */
+struct per_cpu_data {
+    struct cpu* self;           /* Pointer to self */
+    struct thread* current;     /* Current thread */
+    struct thread* idle;        /* Idle thread */
+    uint64_t apic_id;           /* Local APIC ID */
+    uint32_t cpu_id;            /* Logical CPU ID */
+    int preemption_depth;       /* Preemption counter */
+    int interrupt_depth;       /* Interrupt nesting */
+
+    /* Scheduler runqueue */
+    struct runqueue runqueue;
+
+    /* Statistics */
+    uint64_t switches;
+    uint64_t interrupts;
+    uint64_t timer_ticks;
+} __attribute__((aligned(PAGE_SIZE)));
+
+/* CPU Descriptor */
+struct cpu {
+    struct per_cpu_data* data;
+    bool online;
+    bool active;
+    uint32_t package_id;
+    uint32_t core_id;
+    struct cpu* next;
+};
+
+/* Spinlock */
+typedef struct {
+    volatile uint32_t value;
+    uint32_t flags;
+    struct cpu* owner;
+#ifdef DEBUG_LOCKS
+    const char* name;
+    const char* file;
+    int line;
+#endif
+} spinlock_t;
+
+/* RW Lock */
+typedef struct {
+    volatile uint32_t state;    /* High bit: write, Low bits: readers */
+} rwlock_t;
+
+/* IPI Messages */
+enum ipi_type {
+    IPI_TLB_SHOOTDOWN,
+    IPI_RESCHEDULE,
+    IPI_CALL_FUNCTION,
+    IPI_STOP_CPU
+};
+
+struct ipi_message {
+    enum ipi_type type;
+    void (*func)(void*);
+    void* info;
+    volatile int target_count;
+    volatile int processed_count;
+    spinlock_t lock;
+};
+````
+
+**Functions to Implement**:
+
+1. `smp_init(void)` - Initialize SMP subsystem
+2. `smp_boot_aps(void)` - Boot Application Processors
+3. `per_cpu_init(void)` - Initialize per-CPU data
+4. `get_cpu_data(void)` - Get current CPU data
+5. `spinlock_init(spinlock_t* lock)` - Initialize spinlock
+6. `spinlock_acquire(spinlock_t* lock)` - Acquire spinlock
+7. `spinlock_release(spinlock_t* lock)` - Release spinlock
+8. `send_ipi(uint32_t cpu_id, enum ipi_type type)` - Send IPI
+9. `handle_ipi(void)` - IPI interrupt handler
+
+**Algorithmic Details**:
+
+**IPI Handling**:
+
+1. Sender prepares `ipi_message`.
+2. Sender writes to Local APIC ICR (Interrupt Command Register).
+3. Sender waits (spin or notify) for completion if synchronous.
+4. Receiver gets vector interrupt.
+5. Receiver reads message, executes action (e.g., `flush_tlb`).
+6. Receiver acknowledges.
+
+### 10.2 Virtualization Support - Complete Implementation
+
+#### Requirements
+
+- **Type-2 Hypervisor**: Run generic VMs
+- **Hardware Acceleration**: Use Intel VT-x or AMD-V
+- **Nested Paging**: EPT (Intel) or NPT (AMD)
+- **I/O Virtualization**: IOMMU support
+
+#### Implementation Details
+
+**Data Structures (Intel VT-x)**:
+
+```c
+/* VMCS Region */
+struct vmcs {
+    uint32_t revision_id;
+    uint32_t abort_indicator;
+    uint8_t data[PAGE_SIZE - 8];
+};
+
+/* EPT Entry */
+union ept_entry {
+    uint64_t raw;
+    struct {
+        uint64_t read : 1;
+        uint64_t write : 1;
+        uint64_t execute : 1;
+        uint64_t type : 3;
+        uint64_t ignore_pat : 1;
+        uint64_t large_page : 1;
+        uint64_t accessed : 1;
+        uint64_t dirty : 1;
+        uint64_t user_mode : 1;
+        uint64_t ignored : 1;
+        uint64_t pfn : 40;
+        uint64_t available : 12;
+    } fields;
+};
+
+/* VCPU State */
+struct vcpu {
+    struct vmcs* vmcs;
+    uint64_t host_rsp;
+    uint64_t guest_regs[16];
+    uint64_t cr3_target_count;
+    bool launched;
+    int state;
+};
+```
+
+**Functions to Implement**:
+
+1. `kvm_init(void)` - Check CPU support and enable VMX/SVM
+2. `vcpu_create(struct vm* vm)` - Create virtual CPU
+3. `vcpu_run(struct vcpu* vcpu)` - VM entry loop
+4. `vm_exit_handler(struct vcpu* vcpu)` - Handle VM exits
+5. `ept_map(struct vcpu* vcpu, uint64_t gpa, uint64_t hpa)` - Map memory
+
+### 10.3 Real-time Features - Complete Implementation
+
+#### Requirements
+
+- **Preemptible Kernel**: Minimize interrupt latency
+- **Priority Inheritance**: Prevent priority inversion
+- **High-Resolution Timers**: Nanosecond precision
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct rt_mutex {
+    spinlock_t lock;
+    struct thread* owner;
+    struct list_head wait_list; /* Threads blocked on this mutex */
+    int original_priority;
+};
+
+struct hrtimer {
+    uint64_t expiry_ns;
+    void (*callback)(struct hrtimer*);
+    struct rb_node node;        /* Red-black tree node */
+};
+```
+
+**Priority Inheritance Algorithm**:
+
+1. When Thread A (Low Prio) holds Mutex M.
+2. Thread B (High Prio) tries to lock M.
+3. B blocks.
+4. Kernel checks M->owner (A).
+5. If A->priority < B->priority, boost A->priority = B->priority.
+6. Make A inheritor of B's priority effectively.
+7. Recurse if A is blocked on another mutex.
+8. On unlock, restore A's original priority.
+
+---
+
+## Phase 11: Deployment & Distribution (Months 29-32)
+
+### Timeline Overview
+
+| Week  | Milestone           | Deliverables              |
+| ----- | ------------------- | ------------------------- |
+| 1-4   | Package Format      | Spec, builder, signer     |
+| 5-8   | Dependency Resolver | SAT solver implementation |
+| 9-12  | Network Repository  | HTTP client, repo layout  |
+| 13-16 | System Installer    | Partitioning, formatting  |
+
+### 11.1 Package Manager - Complete Implementation
+
+#### Requirements
+
+- **Package Format**: Compressed archive (zstd) with metadata (TOML)
+- **Dependency Resolution**: Versioned dependencies
+- **Security**: Signed packages (Ed25519)
+- **Repositories**: Local and remote (HTTP/HTTPS)
+- **Transactions**: Atomic install/update/remove
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* Detailed Package Metadata */
+struct package_metadata {
+    char* name;
+    char* version;          /* SemVer compliant */
+    char* description;
+    char* maintainer;
+    char* license;
+    char* arch;            /* x86_64, aarch64 */
+
+    /* Dependencies */
+    struct dependency* depends;
+    struct dependency* conflicts;
+    struct dependency* provides;
+    size_t dep_count;
+
+    /* File Manifest */
+    struct file_entry* files;
+    size_t file_count;
+
+    /* Scripts */
+    char* pre_install;
+    char* post_install;
+    char* pre_remove;
+    char* post_remove;
+};
+
+struct dependency {
+    char* name;
+    enum cmp_op { EQ, GT, LT, GE, LE } op;
+    char* version;
+};
+
+struct repository {
+    char* name;
+    char* url;
+    uint8_t pubkey[32];     /* Ed25519 public key */
+    struct package_metadata* cache;
+    size_t cache_size;
+};
+
+/* Transaction Step */
+enum step_type { INSTALL, REMOVE, UPDATE };
+struct transaction_step {
+    enum step_type type;
+    struct package_metadata* pkg;
+    struct transaction_step* next;
+};
+```
+
+**Functions to Implement**:
+
+1. `pkg_load_metadata(const char* path)` - Parse package metadata
+2. `pkg_verify_signature(const char* path, uint8_t* pubkey)` - Verify security
+3. `pkg_solve_dependencies(const char* target, struct repository* repo)` - Create transaction
+4. `pkg_execute_transaction(struct transaction_step* steps)` - Apply changes
+5. `pkg_database_add(struct package_metadata* pkg)` - Update local DB
+
+**Dependency Resolution Algorithm (SAT-inspired)**:
+
+1. Create a goal: "Install PkgA".
+2. Add PkgA dependencies to the queue.
+3. For each dependency, find candidates in repositories.
+4. Filter candidates by version constraints.
+5. If multiple candidates, pick highest version (heuristic).
+6. If conflict detected (e.g., PkgB conflicts with PkgC), backtrack or error.
+7. Build a directed acyclic graph (DAG) of the solution.
+8. Topological sort the DAG to determine install order.
+
+### 11.2 System Installer - Complete Implementation
+
+#### Requirements
+
+- **Disk Detection**: Scan available drives (NVMe, SATA, USB)
+- **Partitioning**: Create GPT partitions (EFI, Swap, Root)
+- **Filesystem Creation**: Format partitions (FAT32, LFSX)
+- **Bootstrap**: Copy base system files
+- **Bootloader Setup**: Install GRUB or Limine
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct partition_plan {
+    char* disk_dev;         /* e.g., /dev/nvme0n1 */
+    uint64_t total_size;
+
+    struct {
+        uint64_t size;
+        const char* type;   /* "EFI System", "Linux Filesystem" */
+        const char* mount_point;
+    } partitions[4];        /* Simplified for example */
+};
+
+struct install_config {
+    char hostname[64];
+    char username[32];
+    char password_hash[128];
+    char timezone[32];
+    char locale[32];
+    struct partition_plan storage;
+};
+```
+
+**Installation State Machine**:
+
+1. **Welcome**: Language selection.
+2. **Hardware Scan**: Detect disks, network.
+3. **Partitioning**: UI to define `partition_plan`.
+4. **User Setup**: Collect credentials.
+5. **Execution**:
+   - `part_create_table(disk, "gpt")`
+   - `part_add_partition(...)` x N
+   - `mkfs.fat -F32 /dev/nvme0n1p1`
+   - `mkfs.lfsx /dev/nvme0n1p3`
+   - `mount /dev/nvme0n1p3 /mnt/target`
+   - `pkg_install_base("/mnt/target")`
+   - `bootloader_install("/mnt/target")`
+6. **Finish**: Reboot.
+
+---
+
+## Phase 12: Future Architecture (Months 33-36)
+
+### Timeline Overview
+
+| Week  | Milestone           | Deliverables             |
+| ----- | ------------------- | ------------------------ |
+| 1-8   | Microkernel Core    | IPC-centric kernel API   |
+| 9-16  | Userspace Drivers   | Port drivers to userland |
+| 17-24 | Distributed IPC     | Network transparent IPC  |
+| 25-30 | Capability Hardware | CHERI support research   |
+
+### 12.1 Microkernel Transition
+
+#### Strategy
+
+AstraLisp OS is designed as a hybrid kernel, but the long-term goal is a pure microkernel to maximize stability.
+
+1.  **Extract Drivers**: Move USB, AHCI, Network stacks to userspace processes.
+2.  **Define IPC Interfaces**: Strict IDL (Interface Definition Language) for all driver interactions.
+3.  **Kernel Minimalism**: Reduce kernel role to: Scheduling, IPC, Basic Memory Mgmt.
+
+**Proposed IPC Message Format**:
+
+```c
+struct ipc_header {
+    uint64_t source_tid;
+    uint64_t dest_port;
+    uint32_t message_id;
+    uint32_t size;
+    uint32_t flags;         /* BLOCKING, ONE_WAY, etc. */
+};
+```
+
+### 12.2 Distributed OS Features
+
+#### Concept
+
+Treat a cluster of AstraLisp machines as a single system image.
+
+1.  **Global PID Namespace**: Process ID includes Node ID.
+2.  **Object Migration**: Move Lisp objects (heap pages) between nodes transparently.
+3.  **Distributed GC**: Global mark-sweep across nodes.
+
+```c
+/* Distributed Object Reference */
+struct global_ref {
+    uint32_t node_id;
+    uint64_t address;
+};
+```
+
+This roadmap provides a comprehensive path to a production-grade Operating System.
+
+```
 
 ```
