@@ -14,9 +14,11 @@
 
 /* Kernel compatibility */
 #ifdef KERNEL
+#include "../../kernel/mm/heap.h"
+#include "../../kernel/process/process.h"
+#include "../../kernel/process/scheduler.h"
 extern void* kmalloc(size_t size);
 extern void kfree(void* ptr);
-/* Kernel threading primitives would be declared here */
 #else
 #include <stdlib.h>
 #include <pthread.h>
@@ -103,6 +105,65 @@ static void registry_remove(struct lisp_thread* thread) {
 }
 
 /* ========== Thread Entry Point ========== */
+
+#ifdef KERNEL
+/* Kernel thread entry point - called by scheduler with lisp_thread* in r3 */
+static void kernel_thread_entry(void) {
+    /* Get lisp_thread pointer from register (passed in context) */
+    struct lisp_thread* thread;
+    __asm__ volatile ("mr %0, 3" : "=r"(thread));
+    
+    if (!thread) return;
+    
+    set_current_thread(thread);
+    thread->state = THREAD_RUNNING;
+    
+    /* Initialize VM for this kernel thread */
+    if (vm_init(&thread->vm) != 0) {
+        thread->state = THREAD_FAILED;
+        thread->error = lisp_create_string("VM initialization failed", 25);
+        return;
+    }
+    
+    /* Execute the function */
+    if (IS_FUNCTION(thread->function) || IS_BUILTIN(thread->function) || IS_VM_CLOSURE(thread->function)) {
+        if (IS_FUNCTION(thread->function) || IS_VM_CLOSURE(thread->function)) {
+            struct vm_closure* closure = (struct vm_closure*)PTR_VAL(thread->function);
+            vm_push(&thread->vm, thread->function);
+            vm_result_t result = vm_call(&thread->vm, closure, 0);
+            
+            if (result == VM_OK) {
+                thread->result = vm_get_result(&thread->vm);
+                thread->state = THREAD_COMPLETED;
+            } else {
+                thread->error = lisp_create_string(thread->vm.last_error ? 
+                    thread->vm.last_error : "Unknown error", 
+                    thread->vm.last_error ? strlen(thread->vm.last_error) : 13);
+                thread->state = THREAD_FAILED;
+            }
+        } else {
+            /* Builtin function */
+            struct lisp_builtin* builtin = (struct lisp_builtin*)PTR_VAL(thread->function);
+            thread->result = builtin->fn(thread->vm.globals, LISP_NIL);
+            thread->state = THREAD_COMPLETED;
+        }
+    } else {
+        thread->error = lisp_create_string("Invalid function", 16);
+        thread->state = THREAD_FAILED;
+    }
+    
+    /* Cleanup VM */
+    vm_free(&thread->vm);
+    
+    /* Remove from registry if detached */
+    if (thread->detached) {
+        registry_remove(thread);
+        kfree(thread);
+    }
+    
+    /* Thread exit - kernel will clean up */
+}
+#endif
 
 #ifndef KERNEL
 static void* thread_entry(void* arg) {
@@ -256,8 +317,27 @@ int thread_start(struct lisp_thread* thread) {
     }
     thread->native_handle = (void*)handle;
 #else
-    /* Kernel: would use kernel thread creation */
-    return -1; /* Not implemented for kernel yet */
+    /* Kernel mode: Use kernel thread API */
+    extern struct process* current_process;
+    
+    /* Create kernel thread in current process */
+    struct thread* kthread = thread_create(current_process, (void (*)(void))kernel_thread_entry);
+    if (!kthread) {
+        return -1;
+    }
+    
+    /* Store lisp_thread pointer in kernel thread's context for entry function */
+    /* The kernel thread entry will retrieve this and call into Lisp VM */
+    kthread->context.gpr[3] = (uint64_t)thread;  /* Pass as first arg in r3 */
+    
+    /* Add to scheduler */
+    if (scheduler_add_thread(kthread) != 0) {
+        thread_destroy(kthread);
+        return -1;
+    }
+    
+    thread->kernel_thread = kthread;
+    thread->state = THREAD_RUNNING;
 #endif
     
     return 0;
