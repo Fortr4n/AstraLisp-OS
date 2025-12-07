@@ -3339,3 +3339,1240 @@ struct kernel_lisp_function {
 ---
 
 _Document continues with Phases 7-12..._
+
+---
+
+## Phase 7: Device Drivers (Months 19-21)
+
+### Timeline Overview
+
+| Week  | Milestone           | Deliverables             |
+| ----- | ------------------- | ------------------------ |
+| 1-2   | USB Host Controller | UHCI, OHCI, EHCI, xHCI   |
+| 3-4   | USB Device Classes  | HID, Mass Storage, Audio |
+| 5-6   | Graphics Drivers    | VESA, Intel, AMD basic   |
+| 7-8   | Audio Drivers       | AC'97, HDA               |
+| 9-10  | Power Management    | ACPI, suspend/resume     |
+| 11-12 | Peripheral Drivers  | RTC, CMOS, Serial ports  |
+
+### 7.1 USB Host Controller Driver - Complete Implementation
+
+#### Requirements
+
+- **UHCI/OHCI/EHCI/xHCI**: Support all USB host controller interfaces
+- **Hub Support**: USB hub detection and device enumeration
+- **Power Management**: Port power control, suspend/resume
+- **Transfer Types**: Control, bulk, interrupt, isochronous
+- **Bandwidth Management**: Allocate bandwidth for periodic transfers
+- **Hot-plug**: Handle device insertion/removal
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+enum usb_speed {
+    USB_SPEED_LOW = 0,      /* 1.5 Mbps */
+    USB_SPEED_FULL = 1,     /* 12 Mbps */
+    USB_SPEED_HIGH = 2,     /* 480 Mbps */
+    USB_SPEED_SUPER = 3     /* 5 Gbps */
+};
+
+enum usb_transfer_type {
+    USB_TRANSFER_CONTROL = 0,
+    USB_TRANSFER_ISOCHRONOUS = 1,
+    USB_TRANSFER_BULK = 2,
+    USB_TRANSFER_INTERRUPT = 3
+};
+
+struct usb_endpoint {
+    uint8_t address;
+    enum usb_transfer_type type;
+    uint16_t max_packet_size;
+    uint8_t interval;           /* For interrupt/isochronous */
+    bool toggle;                /* Data toggle bit */
+};
+
+struct usb_interface {
+    uint8_t interface_number;
+    uint8_t alternate_setting;
+    uint8_t class_code;
+    uint8_t subclass_code;
+    uint8_t protocol;
+    struct usb_endpoint* endpoints;
+    uint8_t endpoint_count;
+    void* driver;               /* Bound driver */
+    struct usb_interface* next;
+};
+
+struct usb_device {
+    uint8_t address;
+    enum usb_speed speed;
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint16_t device_version;
+    uint8_t class_code;
+    uint8_t subclass_code;
+    uint8_t protocol;
+    char manufacturer[64];
+    char product[64];
+    char serial_number[64];
+
+    /* Configuration */
+    uint8_t configuration;
+    struct usb_interface* interfaces;
+    uint8_t interface_count;
+
+    /* Control endpoint */
+    struct usb_endpoint ep0;
+
+    /* Parent hub */
+    struct usb_device* parent;
+    uint8_t parent_port;
+
+    /* For hubs */
+    bool is_hub;
+    uint8_t num_ports;
+    struct usb_device* children[16];
+
+    /* Host controller */
+    struct usb_hc* hc;
+
+    spinlock_t lock;
+};
+
+struct usb_request {
+    uint8_t type;               /* Request type */
+    uint8_t request;            /* Request code */
+    uint16_t value;
+    uint16_t index;
+    uint16_t length;
+};
+
+struct usb_transfer {
+    struct usb_device* device;
+    struct usb_endpoint* endpoint;
+    enum usb_transfer_type type;
+
+    /* Buffer */
+    void* buffer;
+    size_t length;
+    size_t actual_length;
+
+    /* Setup packet (for control) */
+    struct usb_request setup;
+
+    /* Status */
+    int status;
+    bool complete;
+
+    /* Callback */
+    void (*callback)(struct usb_transfer*);
+    void* context;
+
+    /* Scheduling */
+    struct usb_transfer* next;
+};
+
+struct usb_hc_ops {
+    int (*init)(struct usb_hc* hc);
+    int (*shutdown)(struct usb_hc* hc);
+    int (*reset)(struct usb_hc* hc);
+    int (*submit)(struct usb_hc* hc, struct usb_transfer* transfer);
+    int (*cancel)(struct usb_hc* hc, struct usb_transfer* transfer);
+    int (*port_status)(struct usb_hc* hc, int port, uint32_t* status);
+    int (*port_reset)(struct usb_hc* hc, int port);
+    int (*port_enable)(struct usb_hc* hc, int port, bool enable);
+};
+
+struct usb_hc {
+    char name[32];
+    uint32_t type;              /* UHCI, OHCI, EHCI, xHCI */
+    uintptr_t base_addr;
+    uint32_t irq;
+
+    struct usb_hc_ops* ops;
+
+    /* Root hub */
+    uint8_t num_ports;
+    struct usb_device* root_hub;
+
+    /* Device management */
+    struct usb_device* devices[128];
+    uint8_t next_address;
+
+    /* Transfer queues */
+    struct usb_transfer* pending;
+    struct usb_transfer* active;
+
+    spinlock_t lock;
+};
+```
+
+**Functions to Implement**:
+
+**USB Core**:
+
+1. `usb_init(void)` - Initialize USB subsystem
+2. `usb_register_hc(struct usb_hc* hc)` - Register host controller
+3. `usb_unregister_hc(struct usb_hc* hc)` - Unregister host controller
+4. `usb_new_device(struct usb_hc* hc, struct usb_device* parent, int port, enum usb_speed speed)` - Enumerate new device
+5. `usb_disconnect_device(struct usb_device* dev)` - Disconnect device
+6. `usb_set_address(struct usb_device* dev, uint8_t address)` - Set device address
+7. `usb_get_descriptor(struct usb_device* dev, uint8_t type, uint8_t index, void* buf, size_t len)` - Get descriptor
+8. `usb_set_configuration(struct usb_device* dev, uint8_t config)` - Set configuration
+9. `usb_control_transfer(struct usb_device* dev, struct usb_request* req, void* buf, size_t len)` - Control transfer
+10. `usb_bulk_transfer(struct usb_device* dev, struct usb_endpoint* ep, void* buf, size_t len)` - Bulk transfer
+11. `usb_interrupt_transfer(struct usb_device* dev, struct usb_endpoint* ep, void* buf, size_t len, int interval)` - Interrupt transfer
+
+**xHCI Driver**:
+
+1. `xhci_init(struct usb_hc* hc)` - Initialize xHCI controller
+2. `xhci_reset(struct usb_hc* hc)` - Reset controller
+3. `xhci_start(struct usb_hc* hc)` - Start controller
+4. `xhci_stop(struct usb_hc* hc)` - Stop controller
+5. `xhci_alloc_ring(struct xhci_ring* ring, int segments)` - Allocate transfer ring
+6. `xhci_free_ring(struct xhci_ring* ring)` - Free transfer ring
+7. `xhci_enqueue_trb(struct xhci_ring* ring, struct xhci_trb* trb)` - Enqueue TRB
+8. `xhci_handle_event(struct usb_hc* hc, struct xhci_trb* event)` - Handle event
+9. `xhci_address_device(struct usb_hc* hc, struct usb_device* dev)` - Address device
+10. `xhci_configure_endpoint(struct usb_hc* hc, struct usb_device* dev, struct usb_endpoint* ep)` - Configure endpoint
+
+**USB Hub Driver**:
+
+1. `usb_hub_init(struct usb_device* hub)` - Initialize hub
+2. `usb_hub_get_port_status(struct usb_device* hub, int port, uint32_t* status)` - Get port status
+3. `usb_hub_port_reset(struct usb_device* hub, int port)` - Reset port
+4. `usb_hub_port_power(struct usb_device* hub, int port, bool on)` - Power port
+5. `usb_hub_scan_ports(struct usb_device* hub)` - Scan for new devices
+
+**Device Enumeration Algorithm**:
+
+1. Detect device connection (port status change)
+2. Reset port
+3. Determine device speed
+4. Allocate device address
+5. Set device address (SET_ADDRESS request)
+6. Get device descriptor (GET_DESCRIPTOR request)
+7. Get configuration descriptor
+8. Set configuration (SET_CONFIGURATION request)
+9. Load appropriate class driver
+10. Bind driver to device
+
+---
+
+### 7.2 USB HID Class Driver - Complete Implementation
+
+#### Requirements
+
+- **Keyboard Support**: Full keyboard with all keys
+- **Mouse Support**: Relative and absolute positioning
+- **Generic HID**: Support for custom HID devices
+- **Report Parsing**: Parse HID report descriptors
+- **LED Control**: Caps/Num/Scroll lock LEDs
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct hid_report_item {
+    uint8_t type;               /* Main, Global, Local */
+    uint8_t tag;
+    int32_t value;
+    uint8_t size;
+};
+
+struct hid_field {
+    uint32_t usage_page;
+    uint32_t usage_min;
+    uint32_t usage_max;
+    int32_t logical_min;
+    int32_t logical_max;
+    int32_t physical_min;
+    int32_t physical_max;
+    uint8_t report_size;        /* Bits per field */
+    uint8_t report_count;       /* Number of fields */
+    uint32_t flags;             /* Constant, Variable, Relative, etc. */
+    struct hid_field* next;
+};
+
+struct hid_report {
+    uint8_t id;
+    uint8_t type;               /* Input, Output, Feature */
+    struct hid_field* fields;
+    uint16_t size;              /* Total size in bits */
+    struct hid_report* next;
+};
+
+struct hid_device {
+    struct usb_device* usb_dev;
+    struct usb_interface* interface;
+    struct usb_endpoint* in_endpoint;
+    struct usb_endpoint* out_endpoint;
+
+    /* Report descriptor */
+    uint8_t* report_desc;
+    size_t report_desc_len;
+    struct hid_report* reports;
+
+    /* Current state */
+    uint8_t* report_buffer;
+    size_t report_buffer_len;
+
+    /* Callbacks */
+    void (*input_handler)(struct hid_device*, struct hid_report*, void*);
+
+    /* Keyboard state (if keyboard) */
+    uint8_t keyboard_leds;
+    uint8_t keyboard_modifiers;
+    uint8_t keyboard_keys[6];
+
+    /* Mouse state (if mouse) */
+    int16_t mouse_x;
+    int16_t mouse_y;
+    int8_t mouse_wheel;
+    uint8_t mouse_buttons;
+
+    spinlock_t lock;
+};
+
+/* HID Usage Pages */
+#define HID_UP_GENERIC_DESKTOP  0x01
+#define HID_UP_KEYBOARD         0x07
+#define HID_UP_LED              0x08
+#define HID_UP_BUTTON           0x09
+
+/* Desktop Usages */
+#define HID_USAGE_POINTER       0x01
+#define HID_USAGE_MOUSE         0x02
+#define HID_USAGE_KEYBOARD      0x06
+#define HID_USAGE_X             0x30
+#define HID_USAGE_Y             0x31
+#define HID_USAGE_WHEEL         0x38
+```
+
+**Functions to Implement**:
+
+1. `hid_probe(struct usb_device* dev, struct usb_interface* intf)` - Probe HID device
+2. `hid_disconnect(struct hid_device* hid)` - Disconnect HID device
+3. `hid_parse_report_desc(struct hid_device* hid)` - Parse report descriptor
+4. `hid_get_report(struct hid_device* hid, uint8_t type, uint8_t id, void* buf, size_t len)` - Get report
+5. `hid_set_report(struct hid_device* hid, uint8_t type, uint8_t id, void* buf, size_t len)` - Set report
+6. `hid_set_idle(struct hid_device* hid, uint8_t duration, uint8_t report_id)` - Set idle rate
+7. `hid_set_protocol(struct hid_device* hid, uint8_t protocol)` - Set protocol (boot/report)
+8. `hid_input_report(struct hid_device* hid, uint8_t* data, size_t len)` - Process input report
+9. `hid_keyboard_event(struct hid_device* hid, uint8_t* data)` - Process keyboard report
+10. `hid_mouse_event(struct hid_device* hid, uint8_t* data)` - Process mouse report
+11. `hid_set_leds(struct hid_device* hid, uint8_t leds)` - Set keyboard LEDs
+
+**Report Descriptor Parsing**:
+
+```c
+int hid_parse_report_desc(struct hid_device* hid) {
+    uint8_t* p = hid->report_desc;
+    uint8_t* end = p + hid->report_desc_len;
+
+    /* Parser state */
+    uint32_t usage_page = 0;
+    uint32_t usage = 0;
+    int32_t logical_min = 0;
+    int32_t logical_max = 0;
+    uint8_t report_size = 0;
+    uint8_t report_count = 0;
+    uint8_t report_id = 0;
+
+    while (p < end) {
+        uint8_t prefix = *p++;
+        uint8_t type = (prefix >> 2) & 0x03;
+        uint8_t tag = (prefix >> 4) & 0x0F;
+        uint8_t size = prefix & 0x03;
+        if (size == 3) size = 4;
+
+        int32_t value = 0;
+        for (int i = 0; i < size; i++) {
+            value |= (*p++) << (i * 8);
+        }
+
+        switch (type) {
+            case 0: /* Main */
+                switch (tag) {
+                    case 0x8: /* Input */
+                    case 0x9: /* Output */
+                    case 0xB: /* Feature */
+                        /* Create field with current state */
+                        break;
+                }
+                break;
+            case 1: /* Global */
+                switch (tag) {
+                    case 0x0: usage_page = value; break;
+                    case 0x1: logical_min = value; break;
+                    case 0x2: logical_max = value; break;
+                    case 0x7: report_size = value; break;
+                    case 0x9: report_count = value; break;
+                    case 0x8: report_id = value; break;
+                }
+                break;
+            case 2: /* Local */
+                switch (tag) {
+                    case 0x0: usage = value; break;
+                }
+                break;
+        }
+    }
+    return 0;
+}
+```
+
+---
+
+### 7.3 ACPI Power Management - Complete Implementation
+
+#### Requirements
+
+- **ACPI Table Parsing**: RSDP, RSDT/XSDT, FADT, DSDT, SSDT
+- **AML Interpreter**: Execute ACPI Machine Language
+- **Power States**: S0-S5 system states
+- **Device Power**: D0-D3 device states
+- **Thermal Management**: Temperature monitoring, cooling
+- **Battery Management**: Battery status, charging
+- **Button Events**: Power button, sleep button, lid
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* ACPI table header */
+struct acpi_header {
+    char signature[4];
+    uint32_t length;
+    uint8_t revision;
+    uint8_t checksum;
+    char oem_id[6];
+    char oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+};
+
+/* Root System Description Pointer */
+struct acpi_rsdp {
+    char signature[8];
+    uint8_t checksum;
+    char oem_id[6];
+    uint8_t revision;
+    uint32_t rsdt_address;
+    /* ACPI 2.0+ */
+    uint32_t length;
+    uint64_t xsdt_address;
+    uint8_t extended_checksum;
+    uint8_t reserved[3];
+};
+
+/* Fixed ACPI Description Table */
+struct acpi_fadt {
+    struct acpi_header header;
+    uint32_t facs_address;
+    uint32_t dsdt_address;
+    uint8_t reserved1;
+    uint8_t preferred_pm_profile;
+    uint16_t sci_interrupt;
+    uint32_t smi_command;
+    uint8_t acpi_enable;
+    uint8_t acpi_disable;
+    uint8_t s4bios_req;
+    uint8_t pstate_control;
+    uint32_t pm1a_event_block;
+    uint32_t pm1b_event_block;
+    uint32_t pm1a_control_block;
+    uint32_t pm1b_control_block;
+    /* More fields... */
+};
+
+/* ACPI namespace object */
+struct acpi_object {
+    char name[5];               /* 4 chars + null */
+    uint8_t type;
+    union {
+        uint64_t integer;
+        struct {
+            void* data;
+            size_t length;
+        } buffer;
+        struct {
+            char* value;
+            size_t length;
+        } string;
+        struct acpi_object** elements;
+        struct {
+            uint8_t* code;
+            size_t length;
+        } method;
+    } value;
+    struct acpi_object* parent;
+    struct acpi_object* children;
+    struct acpi_object* next;
+};
+
+/* AML interpreter state */
+struct aml_state {
+    uint8_t* code;
+    uint8_t* pc;
+    uint8_t* end;
+    struct acpi_object* scope;
+    struct acpi_object* locals[8];
+    struct acpi_object* args[7];
+    struct aml_state* return_to;
+    uint64_t return_value;
+};
+
+/* Power state */
+enum acpi_power_state {
+    ACPI_STATE_S0,              /* Working */
+    ACPI_STATE_S1,              /* Sleeping, CPU stops */
+    ACPI_STATE_S2,              /* Sleeping, CPU off */
+    ACPI_STATE_S3,              /* Suspend to RAM */
+    ACPI_STATE_S4,              /* Suspend to disk */
+    ACPI_STATE_S5               /* Soft off */
+};
+
+struct acpi_state {
+    struct acpi_rsdp* rsdp;
+    struct acpi_fadt* fadt;
+    struct acpi_header* dsdt;
+    struct acpi_object* namespace;
+
+    /* PM registers */
+    uint32_t pm1a_event;
+    uint32_t pm1b_event;
+    uint32_t pm1a_control;
+    uint32_t pm1b_control;
+
+    /* Current state */
+    enum acpi_power_state power_state;
+
+    /* Event handlers */
+    void (*power_button_handler)(void);
+    void (*sleep_button_handler)(void);
+    void (*lid_handler)(bool open);
+
+    spinlock_t lock;
+};
+```
+
+**Functions to Implement**:
+
+**Table Parsing**:
+
+1. `acpi_init(void)` - Initialize ACPI
+2. `acpi_find_rsdp(void)` - Find RSDP in memory
+3. `acpi_parse_rsdt(struct acpi_rsdp* rsdp)` - Parse RSDT/XSDT
+4. `acpi_find_table(const char* signature)` - Find table by signature
+5. `acpi_validate_checksum(struct acpi_header* table)` - Validate checksum
+
+**AML Interpreter**:
+
+1. `aml_init(struct aml_state* state, uint8_t* code, size_t length)` - Initialize interpreter
+2. `aml_execute(struct aml_state* state)` - Execute AML code
+3. `aml_evaluate_name(struct aml_state* state, const char* name)` - Evaluate named object
+4. `aml_call_method(struct acpi_object* method, struct acpi_object** args)` - Call method
+5. `aml_parse_opcode(struct aml_state* state)` - Parse and execute opcode
+6. `aml_resolve_name(struct aml_state* state, const char* name)` - Resolve name in namespace
+
+**Power Management**:
+
+1. `acpi_enter_sleep_state(enum acpi_power_state state)` - Enter sleep state
+2. `acpi_wake_from_sleep(void)` - Wake from sleep
+3. `acpi_get_battery_status(struct acpi_battery_status* status)` - Get battery status
+4. `acpi_get_thermal_zone(const char* name, struct acpi_thermal* thermal)` - Get thermal zone
+5. `acpi_set_cooling_policy(int policy)` - Set cooling policy
+6. `acpi_handle_event(uint32_t event)` - Handle ACPI event
+
+**Power State Transition**:
+
+```c
+int acpi_enter_sleep_state(enum acpi_power_state state) {
+    uint16_t slp_typa, slp_typb;
+
+    /* Get SLP_TYP values from _Sx method */
+    char method_name[5];
+    snprintf(method_name, 5, "\\_S%d", state);
+    struct acpi_object* sx = aml_resolve_name(NULL, method_name);
+    if (!sx) return -ENOENT;
+
+    slp_typa = sx->value.elements[0]->value.integer;
+    slp_typb = sx->value.elements[1]->value.integer;
+
+    /* Prepare for sleep */
+    acpi_call_method("\\_PTS", state);
+
+    /* Save CPU state */
+    save_cpu_state();
+
+    /* Disable interrupts */
+    cli();
+
+    /* Set SLP_TYP and SLP_EN */
+    outw(acpi_state.pm1a_control, (slp_typa << 10) | (1 << 13));
+    if (acpi_state.pm1b_control) {
+        outw(acpi_state.pm1b_control, (slp_typb << 10) | (1 << 13));
+    }
+
+    /* Should not reach here for S3/S4/S5 */
+    /* For S1/S2, wait for wake */
+    sti();
+
+    /* Wake handlers */
+    acpi_call_method("\\_WAK", state);
+
+    return 0;
+}
+```
+
+---
+
+## Phase 8: Testing and Quality Assurance (Months 22-24)
+
+### Timeline Overview
+
+| Week  | Milestone              | Deliverables              |
+| ----- | ---------------------- | ------------------------- |
+| 1-2   | Unit Testing Framework | Test harness, assertions  |
+| 3-4   | Kernel Unit Tests      | PMM, VMM, scheduler tests |
+| 5-6   | Integration Tests      | Multi-component tests     |
+| 7-8   | System Tests           | Full system scenarios     |
+| 9-10  | Performance Testing    | Benchmarks, profiling     |
+| 11-12 | Stress Testing         | Long-running, edge cases  |
+
+### 8.1 Unit Testing Framework - Complete Implementation
+
+#### Requirements
+
+- **Test Discovery**: Automatic test detection
+- **Assertions**: Rich assertion library
+- **Fixtures**: Setup/teardown support
+- **Mocking**: Mock functions and objects
+- **Coverage**: Code coverage reporting
+- **Reporting**: Test results and statistics
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* Test result */
+enum test_status {
+    TEST_PASSED,
+    TEST_FAILED,
+    TEST_SKIPPED,
+    TEST_ERROR
+};
+
+struct test_result {
+    const char* test_name;
+    const char* suite_name;
+    enum test_status status;
+    const char* message;
+    const char* file;
+    int line;
+    uint64_t duration_us;
+    struct test_result* next;
+};
+
+/* Test case */
+struct test_case {
+    const char* name;
+    void (*test_fn)(struct test_context*);
+    void (*setup)(struct test_context*);
+    void (*teardown)(struct test_context*);
+    bool skip;
+    const char* skip_reason;
+    struct test_case* next;
+};
+
+/* Test suite */
+struct test_suite {
+    const char* name;
+    struct test_case* tests;
+    void (*suite_setup)(void);
+    void (*suite_teardown)(void);
+    uint32_t test_count;
+    uint32_t passed;
+    uint32_t failed;
+    uint32_t skipped;
+    struct test_suite* next;
+};
+
+/* Test context */
+struct test_context {
+    struct test_suite* suite;
+    struct test_case* test;
+    struct test_result* result;
+    void* fixture;              /* Test-specific data */
+    jmp_buf fail_jump;
+    bool failed;
+};
+
+/* Mock function */
+struct mock_call {
+    const char* function_name;
+    void** args;
+    size_t arg_count;
+    void* return_value;
+    struct mock_call* next;
+};
+
+struct mock_function {
+    const char* name;
+    void* original;
+    void* mock;
+    struct mock_call* expected_calls;
+    struct mock_call* actual_calls;
+    uint32_t call_count;
+};
+
+/* Test statistics */
+struct test_stats {
+    uint32_t total_suites;
+    uint32_t total_tests;
+    uint32_t passed;
+    uint32_t failed;
+    uint32_t skipped;
+    uint32_t errors;
+    uint64_t total_duration_us;
+};
+```
+
+**Assertion Macros**:
+
+```c
+#define ASSERT_TRUE(expr) \
+    do { \
+        if (!(expr)) { \
+            test_fail(ctx, #expr " is not true", __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_FALSE(expr) \
+    do { \
+        if (expr) { \
+            test_fail(ctx, #expr " is not false", __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_EQ(expected, actual) \
+    do { \
+        if ((expected) != (actual)) { \
+            test_fail_eq(ctx, #expected, #actual, \
+                         (int64_t)(expected), (int64_t)(actual), \
+                         __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_NE(expected, actual) \
+    do { \
+        if ((expected) == (actual)) { \
+            test_fail_ne(ctx, #expected, #actual, \
+                         (int64_t)(expected), __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_NULL(ptr) \
+    ASSERT_EQ(NULL, ptr)
+
+#define ASSERT_NOT_NULL(ptr) \
+    ASSERT_NE(NULL, ptr)
+
+#define ASSERT_STR_EQ(expected, actual) \
+    do { \
+        if (strcmp(expected, actual) != 0) { \
+            test_fail_str(ctx, expected, actual, __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_MEM_EQ(expected, actual, size) \
+    do { \
+        if (memcmp(expected, actual, size) != 0) { \
+            test_fail_mem(ctx, expected, actual, size, __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define ASSERT_IN_RANGE(value, min, max) \
+    do { \
+        if ((value) < (min) || (value) > (max)) { \
+            test_fail_range(ctx, #value, value, min, max, __FILE__, __LINE__); \
+        } \
+    } while (0)
+
+#define TEST(suite, name) \
+    static void test_##suite##_##name(struct test_context* ctx); \
+    static struct test_case __test_##suite##_##name = { \
+        .name = #name, \
+        .test_fn = test_##suite##_##name, \
+    }; \
+    __attribute__((constructor)) static void __register_##suite##_##name(void) { \
+        test_register_case(#suite, &__test_##suite##_##name); \
+    } \
+    static void test_##suite##_##name(struct test_context* ctx)
+```
+
+**Functions to Implement**:
+
+1. `test_init(void)` - Initialize testing framework
+2. `test_register_suite(struct test_suite* suite)` - Register test suite
+3. `test_register_case(const char* suite, struct test_case* test)` - Register test case
+4. `test_run_all(void)` - Run all registered tests
+5. `test_run_suite(const char* name)` - Run specific suite
+6. `test_run_case(struct test_suite* suite, struct test_case* test)` - Run single test
+7. `test_fail(struct test_context* ctx, const char* msg, const char* file, int line)` - Record failure
+8. `test_skip(struct test_context* ctx, const char* reason)` - Skip test
+9. `test_get_stats(struct test_stats* stats)` - Get statistics
+10. `test_print_results(void)` - Print test results
+11. `mock_create(const char* name, void* mock_fn)` - Create mock function
+12. `mock_expect_call(struct mock_function* mock, ...)` - Expect call with args
+13. `mock_verify(struct mock_function* mock)` - Verify mock expectations
+14. `mock_reset(struct mock_function* mock)` - Reset mock
+
+---
+
+### 8.2 Kernel Unit Tests - Complete Implementation
+
+#### Memory Manager Tests
+
+```c
+/* PMM Tests */
+TEST(pmm, alloc_single_frame) {
+    uintptr_t frame = pmm_alloc_frame();
+    ASSERT_NOT_NULL((void*)frame);
+    ASSERT_TRUE(frame % PAGE_SIZE == 0);
+    pmm_free_frame(frame);
+}
+
+TEST(pmm, alloc_multiple_frames) {
+    uintptr_t frames[100];
+    for (int i = 0; i < 100; i++) {
+        frames[i] = pmm_alloc_frame();
+        ASSERT_NOT_NULL((void*)frames[i]);
+    }
+    /* Verify all different */
+    for (int i = 0; i < 100; i++) {
+        for (int j = i + 1; j < 100; j++) {
+            ASSERT_NE(frames[i], frames[j]);
+        }
+    }
+    for (int i = 0; i < 100; i++) {
+        pmm_free_frame(frames[i]);
+    }
+}
+
+TEST(pmm, alloc_contiguous) {
+    uintptr_t base = pmm_alloc_frames(16);
+    ASSERT_NOT_NULL((void*)base);
+    /* Verify contiguous */
+    for (int i = 0; i < 16; i++) {
+        ASSERT_TRUE(pmm_check_frame(base + i * PAGE_SIZE) == 0);
+    }
+    pmm_free_frames(base, 16);
+}
+
+TEST(pmm, exhaust_memory) {
+    size_t count = 0;
+    uintptr_t* frames = kmalloc(1000000 * sizeof(uintptr_t));
+    while (1) {
+        uintptr_t frame = pmm_alloc_frame();
+        if (!frame) break;
+        frames[count++] = frame;
+    }
+    ASSERT_TRUE(count > 0);
+    for (size_t i = 0; i < count; i++) {
+        pmm_free_frame(frames[i]);
+    }
+    kfree(frames);
+}
+
+/* VMM Tests */
+TEST(vmm, map_single_page) {
+    struct address_space* as = vmm_create_address_space(1);
+    ASSERT_NOT_NULL(as);
+
+    uintptr_t virt = 0x40000000;
+    uintptr_t phys = pmm_alloc_frame();
+
+    int ret = vmm_map_page(as, virt, phys, PAGE_PRESENT | PAGE_WRITABLE);
+    ASSERT_EQ(0, ret);
+
+    uintptr_t mapped = vmm_get_physical(as, virt);
+    ASSERT_EQ(phys, mapped);
+
+    vmm_unmap_page(as, virt);
+    vmm_destroy_address_space(as);
+    pmm_free_frame(phys);
+}
+
+TEST(vmm, copy_on_write) {
+    struct address_space* src = vmm_create_address_space(1);
+    struct address_space* dst = vmm_create_address_space(2);
+
+    uintptr_t virt = 0x40000000;
+    uintptr_t phys = pmm_alloc_frame();
+
+    vmm_map_page(src, virt, phys, PAGE_PRESENT | PAGE_WRITABLE);
+
+    /* Write test data */
+    vmm_switch_address_space(src);
+    *(uint32_t*)virt = 0xDEADBEEF;
+
+    /* COW copy */
+    vmm_copy_on_write(src, dst, virt, PAGE_SIZE);
+
+    /* Verify both see same data */
+    vmm_switch_address_space(dst);
+    ASSERT_EQ(0xDEADBEEF, *(uint32_t*)virt);
+
+    /* Write to copy triggers COW */
+    *(uint32_t*)virt = 0x12345678;
+
+    /* Verify source unchanged */
+    vmm_switch_address_space(src);
+    ASSERT_EQ(0xDEADBEEF, *(uint32_t*)virt);
+
+    vmm_destroy_address_space(src);
+    vmm_destroy_address_space(dst);
+}
+```
+
+#### Scheduler Tests
+
+```c
+TEST(scheduler, add_remove_thread) {
+    struct thread* t = thread_create(NULL, test_thread_fn);
+    ASSERT_NOT_NULL(t);
+
+    int ret = scheduler_add_thread(t);
+    ASSERT_EQ(0, ret);
+
+    ret = scheduler_remove_thread(t);
+    ASSERT_EQ(0, ret);
+
+    thread_destroy(t);
+}
+
+TEST(scheduler, priority_scheduling) {
+    struct thread* low = thread_create(NULL, priority_test_fn);
+    struct thread* high = thread_create(NULL, priority_test_fn);
+
+    low->priority = PRIORITY_LOW;
+    high->priority = PRIORITY_HIGH;
+
+    scheduler_add_thread(low);
+    scheduler_add_thread(high);
+
+    /* High priority should run first */
+    struct thread* next = scheduler_schedule();
+    ASSERT_EQ(high, next);
+
+    scheduler_remove_thread(low);
+    scheduler_remove_thread(high);
+    thread_destroy(low);
+    thread_destroy(high);
+}
+
+TEST(scheduler, round_robin) {
+    struct thread* t1 = thread_create(NULL, test_fn);
+    struct thread* t2 = thread_create(NULL, test_fn);
+    struct thread* t3 = thread_create(NULL, test_fn);
+
+    t1->priority = t2->priority = t3->priority = PRIORITY_NORMAL;
+
+    scheduler_add_thread(t1);
+    scheduler_add_thread(t2);
+    scheduler_add_thread(t3);
+
+    /* Should cycle through threads */
+    ASSERT_EQ(t1, scheduler_schedule());
+    scheduler_yield();
+    ASSERT_EQ(t2, scheduler_schedule());
+    scheduler_yield();
+    ASSERT_EQ(t3, scheduler_schedule());
+    scheduler_yield();
+    ASSERT_EQ(t1, scheduler_schedule());
+
+    scheduler_remove_thread(t1);
+    scheduler_remove_thread(t2);
+    scheduler_remove_thread(t3);
+}
+```
+
+---
+
+### 8.3 Performance Testing - Complete Implementation
+
+#### Requirements
+
+- **Benchmarks**: Standardized performance tests
+- **Profiling**: Function-level timing
+- **Memory Profiling**: Allocation tracking
+- **CPU Profiling**: Instruction counting
+- **I/O Profiling**: Throughput measurement
+- **Regression Detection**: Compare against baseline
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct benchmark {
+    const char* name;
+    const char* description;
+    void (*setup)(void);
+    void (*run)(struct benchmark_result*);
+    void (*teardown)(void);
+    uint32_t iterations;
+    uint64_t target_ops;        /* Target ops/sec */
+};
+
+struct benchmark_result {
+    const char* name;
+    uint64_t iterations;
+    uint64_t total_time_ns;
+    uint64_t min_time_ns;
+    uint64_t max_time_ns;
+    uint64_t avg_time_ns;
+    double ops_per_sec;
+    double throughput_mbps;
+    struct benchmark_result* next;
+};
+
+struct profiler_entry {
+    const char* function;
+    uint64_t call_count;
+    uint64_t total_time_ns;
+    uint64_t min_time_ns;
+    uint64_t max_time_ns;
+    uint64_t self_time_ns;
+    uint64_t children_time_ns;
+    struct profiler_entry* parent;
+    struct profiler_entry* children;
+    struct profiler_entry* next;
+};
+
+struct memory_profile {
+    size_t total_allocated;
+    size_t total_freed;
+    size_t peak_usage;
+    size_t current_usage;
+    uint64_t alloc_count;
+    uint64_t free_count;
+    struct allocation_record* live_allocations;
+};
+
+struct allocation_record {
+    void* address;
+    size_t size;
+    const char* file;
+    int line;
+    uint64_t timestamp;
+    struct allocation_record* next;
+};
+```
+
+**Benchmarks**:
+
+```c
+/* Memory allocation benchmark */
+BENCHMARK(memory, malloc_free_cycle, 1000000) {
+    void* p = kmalloc(64);
+    kfree(p);
+}
+
+/* Context switch benchmark */
+BENCHMARK(scheduler, context_switch, 100000) {
+    scheduler_yield();
+}
+
+/* Page fault benchmark */
+BENCHMARK(vmm, page_fault_handling, 10000) {
+    /* Touch new page to trigger fault */
+    volatile uint8_t* p = (uint8_t*)(0x80000000 + result->iteration * PAGE_SIZE);
+    *p = 0;
+}
+
+/* File I/O benchmark */
+BENCHMARK(filesystem, sequential_read, 1000) {
+    char buf[4096];
+    int fd = open("/benchmark/file", O_RDONLY);
+    while (read(fd, buf, sizeof(buf)) > 0);
+    close(fd);
+}
+
+/* Network benchmark */
+BENCHMARK(network, tcp_throughput, 100) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    connect(sock, &server_addr, sizeof(server_addr));
+    char buf[65536];
+    for (int i = 0; i < 1000; i++) {
+        send(sock, buf, sizeof(buf), 0);
+    }
+    close(sock);
+}
+```
+
+**Functions to Implement**:
+
+1. `benchmark_init(void)` - Initialize benchmarking
+2. `benchmark_register(struct benchmark* bench)` - Register benchmark
+3. `benchmark_run_all(void)` - Run all benchmarks
+4. `benchmark_run(const char* name)` - Run specific benchmark
+5. `benchmark_compare(struct benchmark_result* a, struct benchmark_result* b)` - Compare results
+6. `profiler_start(void)` - Start profiling
+7. `profiler_stop(void)` - Stop profiling
+8. `profiler_enter(const char* function)` - Enter function
+9. `profiler_exit(const char* function)` - Exit function
+10. `profiler_report(void)` - Generate profiling report
+11. `memory_profile_start(void)` - Start memory profiling
+12. `memory_profile_stop(void)` - Stop memory profiling
+13. `memory_profile_report(void)` - Generate memory report
+
+---
+
+## Phase 9: Documentation (Months 25-26)
+
+### Timeline Overview
+
+| Week | Milestone         | Deliverables                |
+| ---- | ----------------- | --------------------------- |
+| 1-2  | API Documentation | All public APIs documented  |
+| 3-4  | User Guide        | Installation, configuration |
+| 5-6  | Developer Guide   | Architecture, contributing  |
+| 7-8  | Tutorials         | Step-by-step guides         |
+
+### 9.1 Documentation Standards
+
+#### Requirements
+
+- **API Reference**: Complete documentation of all public APIs
+- **Architecture Guide**: System design and internals
+- **User Manual**: Installation and usage
+- **Developer Guide**: Contributing and development
+- **Tutorials**: Learning resources
+- **Man Pages**: Unix-style documentation
+
+#### Documentation Format
+
+**API Documentation Template**:
+
+````markdown
+# function_name
+
+## Synopsis
+
+```c
+return_type function_name(param_type1 param1, param_type2 param2);
+```
+````
+
+## Description
+
+Detailed description of what the function does.
+
+## Parameters
+
+- `param1`: Description of first parameter
+- `param2`: Description of second parameter
+
+## Return Value
+
+Description of return value, including error conditions.
+
+## Errors
+
+- `ERRNO1`: When this error occurs
+- `ERRNO2`: When this error occurs
+
+## Thread Safety
+
+Whether the function is thread-safe.
+
+## Example
+
+```c
+// Example usage
+int result = function_name(value1, value2);
+if (result < 0) {
+    // Handle error
+}
+```
+
+## See Also
+
+- `related_function1()`
+- `related_function2()`
+
+## Notes
+
+Any additional notes or caveats.
+
+````
+
+**System Call Documentation**:
+```markdown
+# syscall_name(2)
+
+## NAME
+syscall_name - brief description
+
+## SYNOPSIS
+```c
+#include <sys/syscall.h>
+
+long syscall_name(arg_type1 arg1, arg_type2 arg2);
+````
+
+## DESCRIPTION
+
+Full description of the system call.
+
+## ARGUMENTS
+
+- `arg1`: Description
+- `arg2`: Description
+
+## RETURN VALUE
+
+On success, returns X. On error, returns -1 and sets errno.
+
+## ERRORS
+
+- `EFAULT`: Invalid memory address
+- `EINVAL`: Invalid argument
+
+## CONFORMING TO
+
+POSIX.1-2008, Linux
+
+## BUGS
+
+Known issues or limitations.
+
+## EXAMPLE
+
+```c
+if (syscall_name(arg1, arg2) < 0) {
+    perror("syscall_name");
+    exit(1);
+}
+```
+
+## SEE ALSO
+
+related_syscall(2), related_function(3)
+
+```
+
+---
+
+*Document continues with Phases 10-12...*
+
+```
