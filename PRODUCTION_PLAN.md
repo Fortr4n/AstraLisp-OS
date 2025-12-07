@@ -3457,45 +3457,146 @@ struct crypto_op {
 };
 ```
 
+**Detailed API Specification**:
+
+#### 1. `aes_encrypt_block`
+
+```c
+void aes_encrypt_block(struct aes_context* ctx, const uint8_t* in, uint8_t* out);
+```
+
+**Description**:
+Encrypts a single 128-bit block using AES.
+
+1. **Key Expansion**: (Performed in `aes_init`). Generates 11/13/15 round keys from seed key using Rijndael Key Schedule.
+2. **Initial Round**: `AddRoundKey(State, RoundKey[0])`.
+3. **Main Rounds** (Nr-1 iterations):
+   - `SubBytes`: Nonlinear substitution using S-Box.
+   - `ShiftRows`: Cyclic shift of rows 1, 2, 3 by 1, 2, 3 bytes.
+   - `MixColumns`: Matrix multiplication over GF(2^8).
+   - `AddRoundKey`: XOR with RoundKey[i].
+4. **Final Round**:
+   - `SubBytes`
+   - `ShiftRows`
+   - `AddRoundKey`
+     **Side Channel Defense**: Use bitsliced implementation or constant-time S-Box lookups to prevent cache timing attacks.
+
+#### 2. `sha256_update`
+
+```c
+void sha256_update(struct sha256_context* ctx, const uint8_t* data, size_t len);
+```
+
+**Description**:
+Processes input data in 512-bit blocks.
+
+1. Fills internal buffer. When 64 bytes full, triggers `sha256_transform`.
+2. **Transform Logic**:
+   - Expand 16 words into 64 words message schedule (W[0..63]).
+   - Initialize working variables (a..h) from State.
+   - **Main Loop** (64 rounds):
+     - `S1 = RotR(e, 6) ^ RotR(e, 11) ^ RotR(e, 25)`
+     - `ch = (e & f) ^ (~e & g)`
+     - `temp1 = h + S1 + ch + K[i] + W[i]`
+     - `S0 = RotR(a, 2) ^ RotR(a, 13) ^ RotR(a, 22)`
+     - `maj = (a & b) ^ (a & c) ^ (b & c)`
+     - `temp2 = S0 + maj`
+     - Shift variables: `h=g, g=f, f=e, e=d+temp1, d=c, c=b, b=a, a=temp1+temp2`
+   - Add working variables back to State.
+
+#### 3. `rsa_generate_key`
+
+```c
+int rsa_generate_key(struct rsa_key* key, size_t bits);
+```
+
+**Description**:
+Generates RSA keypair.
+
+1. **Prime Generation**: Use Miller-Rabin Primality Test to find two large primes `p` and `q` each of `bits/2`.
+2. check `gcd((p-1), e) == 1` and `gcd((q-1), e) == 1` (where e=65537).
+3. Compute `n = p * q`.
+4. Compute `phi = (p-1) * (q-1)`.
+5. Compute `d = e^-1 mod phi` (Modular Inverse).
+6. Securely clear `p`, `q`, `phi` from stack.
+
+#### 4. `aes_gcm_encrypt`
+
+```c
+int aes_gcm_encrypt(struct aes_context* ctx, const uint8_t* iv, const uint8_t* aad, size_t aad_len, const uint8_t* in, uint8_t* out, size_t len, uint8_t* tag);
+```
+
+**Description**:
+Authenticated Encryption.
+
+1. **CTR Mode**: Encrypts `in` to `out` using AES-CTR with counter starting from IV||1.
+2. **GHASH**: Computes Message Authentication Code.
+   - Hash `AAD` (padded).
+   - Hash `Ciphertext` (padded).
+   - Hash `Lengths` (64-bit aad_len || 64-bit in_len).
+   - Polynomial multiplication in GF(2^128).
+3. **Tag Generation**: XOR GHASH output with `AES(IV||0)`.
+
+**Testing Requirements**:
+
+- Test against NIST vectors (Kat - Known Answer Tests)
+- Test Monte Carlo simulations
+- Test boundary conditions (empty input, large input)
+- Test invalid keys/IVs
+- Valgrind analysis for constant-time compliance
+
+---
+
+### 4.5 Secure Boot - Complete Implementation
+
+#### Requirements
+
+- **Measured Boot**: Measure boot stages into TPM PCRs
+- **Verified Boot**: Verify signatures of boot stages
+- **TPM Integration**: Drivers for TPM 1.2/2.0
+- **Key Hierarchy**: Root of Trust (SRK) managing OS signing keys
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct tpm_pcr_bank {
+    uint32_t pcr_index;
+    uint8_t digest[32]; /* SHA-256 */
+};
+
+struct boot_manifest {
+    uint32_t magic;
+    uint32_t version;
+    uint8_t kernel_hash[32];
+    uint8_t ramdisk_hash[32];
+    uint8_t config_hash[32];
+    uint8_t signature[256]; /* RSA-2048 */
+};
+```
+
 **Functions to Implement**:
 
-**AES**:
+1. `tpm_init(void)` - Initialize TPM driver (TIS/CRB interface)
+2. `tpm_extend(uint32_t pcr, const uint8_t* digest)` - Extend PCR
+3. `tpm_quote(uint32_t pcr_mask, const uint8_t* nonce, uint8_t* signature)` - Get Quote
+4. `secure_boot_verify(void* image, size_t size, uint8_t* expected_hash)` - Verify Hash
+5. `secure_boot_check_signature(struct boot_manifest* manifest)` - Verify RSA Signature
 
-1. `aes_init(struct aes_context* ctx, const uint8_t* key, size_t key_len)` - Initialize
-2. `aes_encrypt_block(struct aes_context* ctx, const uint8_t* in, uint8_t* out)` - Encrypt block
-3. `aes_decrypt_block(struct aes_context* ctx, const uint8_t* in, uint8_t* out)` - Decrypt block
-4. `aes_cbc_encrypt(struct aes_context* ctx, const uint8_t* iv, const uint8_t* in, uint8_t* out, size_t len)` - CBC encrypt
-5. `aes_cbc_decrypt(struct aes_context* ctx, const uint8_t* iv, const uint8_t* in, uint8_t* out, size_t len)` - CBC decrypt
-6. `aes_gcm_encrypt(struct aes_context* ctx, const uint8_t* iv, const uint8_t* aad, size_t aad_len, const uint8_t* in, uint8_t* out, size_t len, uint8_t* tag)` - GCM encrypt
-7. `aes_gcm_decrypt(struct aes_context* ctx, const uint8_t* iv, const uint8_t* aad, size_t aad_len, const uint8_t* in, uint8_t* out, size_t len, const uint8_t* tag)` - GCM decrypt
+**Secure Boot Sequence**:
 
-**SHA-256**:
-
-1. `sha256_init(struct sha256_context* ctx)` - Initialize
-2. `sha256_update(struct sha256_context* ctx, const uint8_t* data, size_t len)` - Update
-3. `sha256_final(struct sha256_context* ctx, uint8_t* hash)` - Finalize
-4. `sha256(const uint8_t* data, size_t len, uint8_t* hash)` - One-shot hash
-
-**RSA**:
-
-1. `rsa_generate_key(struct rsa_key* key, size_t bits)` - Generate key pair
-2. `rsa_encrypt(struct rsa_key* key, const uint8_t* in, size_t in_len, uint8_t* out, size_t* out_len)` - Encrypt
-3. `rsa_decrypt(struct rsa_key* key, const uint8_t* in, size_t in_len, uint8_t* out, size_t* out_len)` - Decrypt
-4. `rsa_sign(struct rsa_key* key, const uint8_t* hash, size_t hash_len, uint8_t* sig, size_t* sig_len)` - Sign
-5. `rsa_verify(struct rsa_key* key, const uint8_t* hash, size_t hash_len, const uint8_t* sig, size_t sig_len)` - Verify
-
-**ECDSA**:
-
-1. `ecdsa_generate_key(struct ecdsa_key* key, int curve)` - Generate key
-2. `ecdsa_sign(struct ecdsa_key* key, const uint8_t* hash, size_t hash_len, uint8_t* sig, size_t* sig_len)` - Sign
-3. `ecdsa_verify(struct ecdsa_key* key, const uint8_t* hash, size_t hash_len, const uint8_t* sig, size_t sig_len)` - Verify
-
-**Random Number Generation**:
-
-1. `rng_init(void)` - Initialize RNG
-2. `rng_get_bytes(uint8_t* buf, size_t len)` - Get random bytes
-3. `rng_seed(const uint8_t* seed, size_t len)` - Add entropy
-4. `rng_reseed(void)` - Force reseed
+1. **BIOS/UEFI**: Measures Bootloader into PCR[0]. Verifies Bootloader Signature.
+2. **Bootloader**:
+   - Initialize TPM driver.
+   - Measure Kernel into PCR[4].
+   - Measure Ramdisk into PCR[5].
+   - Measure Kernel cmdline into PCR[8].
+   - Load `manifest.bin`.
+   - Verify `manifest->signature` using embedded Public Key.
+   - Hash loaded Kernel. Verify match with `manifest->kernel_hash`.
+   - If Match: Jump to Kernel.
+   - If Mismatch: Halt or Recovery Mode.
 
 ---
 
@@ -3582,44 +3683,76 @@ struct point {
 typedef uint32_t color_t;  /* ARGB format */
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `fb_init(struct framebuffer* fb)` - Initialize framebuffer
-2. `fb_set_mode(uint32_t width, uint32_t height, uint8_t bpp)` - Set video mode
-3. `fb_get_modes(struct vbe_mode_info* modes, uint32_t* count)` - Get available modes
-4. `fb_put_pixel(struct framebuffer* fb, int x, int y, color_t color)` - Draw pixel
-5. `fb_get_pixel(struct framebuffer* fb, int x, int y)` - Get pixel
-6. `fb_fill_rect(struct framebuffer* fb, struct rect* r, color_t color)` - Fill rectangle
-7. `fb_draw_rect(struct framebuffer* fb, struct rect* r, color_t color)` - Draw rectangle outline
-8. `fb_draw_line(struct framebuffer* fb, int x1, int y1, int x2, int y2, color_t color)` - Draw line
-9. `fb_blit(struct framebuffer* fb, int x, int y, void* src, uint32_t w, uint32_t h)` - Blit bitmap
-10. `fb_scroll(struct framebuffer* fb, int dx, int dy)` - Scroll content
-11. `fb_clear(struct framebuffer* fb, color_t color)` - Clear screen
-12. `fb_swap_buffers(struct framebuffer* fb)` - Swap double buffer
-13. `fb_mark_dirty(struct framebuffer* fb, struct rect* r)` - Mark dirty region
-14. `fb_flush_dirty(struct framebuffer* fb)` - Flush dirty regions
-
-**Drawing Algorithms**:
-
-**Bresenham's Line Algorithm**:
+#### 1. `fb_put_pixel`
 
 ```c
-void fb_draw_line(struct framebuffer* fb, int x0, int y0, int x1, int y1, color_t color) {
-    int dx = abs(x1 - x0);
-    int dy = abs(y1 - y0);
-    int sx = x0 < x1 ? 1 : -1;
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx - dy;
-
-    while (1) {
-        fb_put_pixel(fb, x0, y0, color);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 < dx) { err += dx; y0 += sy; }
-    }
-}
+void fb_put_pixel(struct framebuffer* fb, int x, int y, color_t color);
 ```
+
+**Description**:
+Draws a single pixel.
+
+1. Checks bounds `(0 <= x < width)` and `(0 <= y < height)`.
+2. Calculates offset: `offset = y * pitch + x * (bpp/8)`.
+3. Writes pixel value to `fb->back_buffer` (if double buffered) or `fb->virtual_addr`.
+
+#### 2. `fb_draw_line` (Bresenham's)
+
+```c
+void fb_draw_line(struct framebuffer* fb, int x0, int y0, int x1, int y1, color_t color);
+```
+
+**Description**:
+Draws a line using integer-only arithmetic.
+
+1. `dx = abs(x1-x0)`, `dy = -abs(y1-y0)`.
+2. `sx = x0 < x1 ? 1 : -1`, `sy = y0 < y1 ? 1 : -1`.
+3. `err = dx + dy`.
+4. Loop:
+   - `put_pixel(x0, y0)`.
+   - If `x0 == x1 && y0 == y1` break.
+   - `e2 = 2 * err`.
+   - If `e2 >= dy`: `err += dy`, `x0 += sx`.
+   - If `e2 <= dx`: `err += dx`, `y0 += sy`.
+
+#### 3. `fb_fill_rect`
+
+```c
+void fb_fill_rect(struct framebuffer* fb, struct rect* r, color_t color);
+```
+
+**Description**:
+Optimized rectangle fill.
+
+1. Clips rectangle to screen bounds.
+2. For each scanline `y` from `r.y` to `r.y + r.height`:
+   - Calculate pointer to start of line in buffer.
+   - Use `memset` (8/16bpp) or `memset32` (32bpp) to fill `r.width` pixels.
+     **Optimization**: Uses AVX/SSE `rep stosd` equivalent for fast fills.
+
+#### 4. `fb_swap_buffers`
+
+```c
+void fb_swap_buffers(struct framebuffer* fb);
+```
+
+**Description**:
+Flips the back buffer to the front.
+
+1. Acquires lock.
+2. `memcpy(front_buffer, back_buffer, size)`.
+3. Clears dirty region list (if implementing dirty rectangles).
+4. Waits for VSync (if supported by VBE/EDID info).
+
+**Detailed Algorithmic Specifications**:
+
+**Dirty Rectangle Tracking**:
+
+1.  **Mark**: On drawing op, union the modified `rect` with existing `dirty_region`.
+2.  **Merge**: If `dirty_count > threshold` or regions overlap significantly, merge into a bounding box to reduce overhead.
+3.  **Flush**: In `swap_buffers`, only copy the pixels contained in the `dirty_region_list` from Back to Front buffer.
 
 ---
 
@@ -3718,36 +3851,77 @@ struct event {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `wm_init(void)` - Initialize window manager
-2. `window_create(struct window* parent, int x, int y, uint32_t w, uint32_t h, const char* title)` - Create window
-3. `window_destroy(struct window* win)` - Destroy window
-4. `window_show(struct window* win)` - Show window
-5. `window_hide(struct window* win)` - Hide window
-6. `window_move(struct window* win, int x, int y)` - Move window
-7. `window_resize(struct window* win, uint32_t w, uint32_t h)` - Resize window
-8. `window_raise(struct window* win)` - Raise to top
-9. `window_lower(struct window* win)` - Lower to bottom
-10. `window_focus(struct window* win)` - Set focus
-11. `window_set_title(struct window* win, const char* title)` - Set title
-12. `window_invalidate(struct window* win, struct rect* r)` - Mark for redraw
-13. `compositor_init(struct framebuffer* fb)` - Initialize compositor
-14. `compositor_add_window(struct window* win)` - Add window
-15. `compositor_remove_window(struct window* win)` - Remove window
-16. `compositor_compose(void)` - Composite all windows
-17. `compositor_dispatch_event(struct event* e)` - Dispatch event
+#### 1. `window_create`
 
-**Compositing Algorithm**:
+```c
+struct window* window_create(struct window* parent, int x, int y, uint32_t w, uint32_t h, const char* title);
+```
 
-1. Clear back buffer (or use damage regions)
-2. For each window from bottom to top:
-   a. If window intersects damaged region:
-   b. Draw window decorations (if decorated)
-   c. Alpha-blend window content to back buffer
-   d. Apply effects (shadows, transparency)
-3. Draw cursor
-4. Swap buffers
+**Description**:
+Creates a new window object.
+
+1. Allocates `window` struct.
+2. Allocates per-window surface (`malloc(w * h * 4)`).
+3. Adds to global window list (default Z-order: Top).
+4. Initializes event queue.
+
+#### 2. `compositor_compose`
+
+```c
+void compositor_compose(void);
+```
+
+**Description**:
+Renders the desktop scene.
+
+1. **Background**: Clears back buffer to background color/wallpaper.
+2. **Window Loop**: Iterates `window_list` from Bottom (Tail) to Top (Head).
+3. **Clipping**: If window is obscured by opaque window above it, skip obscured regions (advanced) or just Painter's Algorithm.
+4. **Resampling**: If `win->surface` resolution differs from window size (scaling).
+5. **Blending**:
+   - `FinalR = (SrcR * Alpha + DstR * (255 - Alpha)) / 255`.
+   - `FinalG = (SrcG * Alpha + DstG * (255 - Alpha)) / 255`.
+   - `FinalB = (SrcB * Alpha + DstB * (255 - Alpha)) / 255`.
+6. **Cursor**: Blit cursor sprite at `cursor_x, cursor_y` (Hardware Sprite if available, else Software).
+7. **Damage Reset**: Clears damage regions.
+
+#### 3. `compositor_dispatch_event`
+
+```c
+void compositor_dispatch_event(struct event* e);
+```
+
+**Description**:
+Routes input to appropriate window.
+
+1. **Mouse**:
+   - Hit testing: Iterate Z-order Top-to-Bottom.
+   - `if (mx >= win.x && mx < win.x + win.w && ...)` -> Target Found.
+   - Transform coordinates global -> local.
+   - Push to `win->events`.
+2. **Keyboard**:
+   - Push to `focused_window->events`.
+3. **Global**: Handle Alt-Tab, global shortcuts.
+
+**Compositing Algorithm Details**:
+
+**Alpha Blending Formula**:
+For each pixel `P(x,y)`:
+$$ C*{out} = \frac{C*{src} \times \alpha + C\_{dst} \times (255 - \alpha)}{255} $$
+Where:
+
+- $C_{src}$ is the pixel color of the window being drawn.
+- $C_{dst}$ is the current background color at that position.
+- $\alpha$ is the window opacity \* per-pixel alpha channel.
+
+**Damage Tracking**:
+To avoid full redraws:
+
+1.  Subtract `ObscuredRegion` (by windows above) from `WindowRect`.
+2.  Intersect result with `DamagedRegion`.
+3.  Only composite the resulting implementation set.
 
 ---
 
@@ -3816,21 +3990,76 @@ struct mouse_state {
 #define MOD_SCROLLLOCK  0x0040
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `input_init(void)` - Initialize input subsystem
-2. `keyboard_init(void)` - Initialize keyboard
-3. `keyboard_handle_scancode(uint8_t scancode)` - Process scancode
-4. `keyboard_set_layout(const char* layout)` - Set keyboard layout
-5. `keyboard_set_repeat(uint32_t delay, uint32_t rate)` - Set repeat rate
-6. `keyboard_set_leds(uint8_t leds)` - Set LED state
-7. `mouse_init(void)` - Initialize mouse
-8. `mouse_handle_packet(uint8_t* packet, size_t len)` - Process mouse packet
-9. `mouse_set_acceleration(float threshold, float accel)` - Set acceleration
-10. `input_poll(struct event* e, uint32_t timeout)` - Poll for event
-11. `input_push_event(struct event* e)` - Push event to queue
-12. `input_get_keyboard_state(struct keyboard_state* state)` - Get keyboard state
-13. `input_get_mouse_state(struct mouse_state* state)` - Get mouse state
+#### 1. `keyboard_handle_scancode`
+
+```c
+void keyboard_handle_scancode(uint8_t scancode);
+```
+
+**Description**:
+State machine for PS/2 Scancode Set 2 translation.
+
+1. **State Tracking**: `E0_PREFIX`, `KEY_RELEASE`.
+2. **Translation**: `Scancode -> KeySym` using layout table.
+3. **Modifier Handling**:
+   - Updates `shift_pressed`, `ctrl_pressed` flags.
+   - Toggles `caps_lock`, `num_lock` LED states.
+4. **Repeat Logic**:
+   - If key is held, `repeat_timer` fires synthetic key events.
+5. **Event Emission**:
+   - Creates `key_event` struct.
+   - Pushes to Global Input Queue.
+
+#### 2. `mouse_handle_packet`
+
+```c
+void mouse_handle_packet(uint8_t* packet, size_t len);
+```
+
+**Description**:
+Processes raw mouse bytes (usually 3 or 4 bytes per PS/2 or USB HID packet).
+
+1. Decodes X/Y displacement and Button flags.
+2. **Acceleration**:
+   - `velocity = sqrt(dx*dx + dy*dy)`.
+   - `factor = (velocity > threshold) ? acceleration_curve(velocity) : 1.0`.
+   - `dx *= factor`.
+3. **Clipping**: Clamps cursor position to screen bounds `[0, width], [0, height]`.
+4. **Drawing**: Marks old cursor region as dirty; Updates `cursor_x/y`; Marks new region dirty.
+5. **Event**: Generates `mouse_event` (Move/Click) and pushes to queue.
+
+#### 3. `input_poll`
+
+```c
+int input_poll(struct event* e, uint32_t timeout);
+```
+
+**Description**:
+Retrieves the next event for the window manager or focused application.
+
+1. Checks `global_event_queue`.
+2. If empty, sleeps process until interrupt fires or timeout expires.
+3. If event available, copies to `e` and returns 1.
+
+**Detailed Algorithmic Specifications**:
+
+**Pointer Acceleration Curve**:
+$$ M*{out} = M*{in} \times (1 + \alpha \times \frac{|V| - T}{T}) $$
+Where:
+
+- $M_{in}$ is raw movement.
+- $V$ is velocity.
+- $T$ is threshold.
+- $\alpha$ is acceleration factor.
+  The curve acts to keep fine movements 1:1 for precision while amplifying fast movements for screen traversal.
+
+**Keyboard Layout Mapping**:
+
+- Uses a multi-layer table `KeyMap[Layout][ModifierState][Scancode]`.
+- Example: `KeyMap[US][SHIFT][0x1E (A)] = 'A'`.
+- Example: `KeyMap[US][NONE][0x1E (A)] = 'a'`.
 
 ---
 
@@ -3935,14 +4164,88 @@ struct kernel_lisp_function {
 (kernel:nanosleep seconds nanoseconds)
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `kernel_lisp_init(struct kernel_lisp* kl)` - Initialize kernel Lisp
-2. `kernel_lisp_eval(struct kernel_lisp* kl, const char* expr)` - Evaluate expression
-3. `kernel_lisp_call(struct kernel_lisp* kl, const char* func, lisp_value args)` - Call function
-4. `kernel_lisp_register_function(struct kernel_lisp* kl, struct kernel_lisp_function* func)` - Register function
-5. `kernel_lisp_gc(struct kernel_lisp* kl)` - Run garbage collection
-6. `kernel_lisp_load_file(struct kernel_lisp* kl, const char* path)` - Load Lisp file
+#### 1. `kernel_lisp_init`
+
+```c
+int kernel_lisp_init(struct kernel_lisp* kl, size_t heap_size, size_t stack_size);
+```
+
+**Description**:
+Initializes a new isolated Lisp environment within the kernel.
+
+1. Allocates continuous physical memory pages for the Heap (`kmalloc_pages`).
+2. Maps pages to a secure virtual address range.
+3. Initializes the Garbage Collector context (`gc_init`).
+4. Creates the Root Environment (Global Symbol Table).
+5. Registers core primitives (`defun`, `if`, etc.) and Kernel Bindings.
+
+#### 2. `kernel_lisp_eval`
+
+```c
+lisp_value kernel_lisp_eval(struct kernel_lisp* kl, const char* expr_str);
+```
+
+**Description**:
+Evaluates a string as Lisp code in the kernel context.
+
+1. **Reads**: Parses `expr_str` into an AST (`lisp_read`).
+2. **Compiles** (Optional): Converts AST to Bytecode (`lisp_compile`).
+3. **Executes**: Runs the code on the VM (`vm_execute` or `eval`).
+4. **Result**: Returns a tagged pointer to the result.
+5. **Errors**: Captures `setjmp/longjmp` exceptions and returns condition object.
+
+#### 3. `kernel_lisp_register_function`
+
+```c
+void kernel_lisp_register_function(struct kernel_lisp* kl, const char* name, int min_args, int max_args, lisp_value (*func)(struct kernel_lisp*, lisp_value), const char* doc);
+```
+
+**Description**:
+Exposes a C kernel function to Lisp.
+
+1. Interns the symbol `name` in the global environment.
+2. Creates a `FUNCTION` object pointing to the C wrapper.
+3. Binds symbol to function.
+4. Stores arity metadata for runtime checking.
+
+#### 4. `kernel_lisp_gc`
+
+```c
+void kernel_lisp_gc(struct kernel_lisp* kl);
+```
+
+**Description**:
+Triggers a Garbage Collection cycle.
+
+1. **Stop-The-World**: Pauses all threads executed in this Lisp Context (using `thread_suspend`).
+2. **Mark Phase**:
+   - Roots: VM Registers, Stack Frames, Global Symbol Table, C Handle Table.
+   - Algorithm: Tricolor Mark-and-Sweep.
+3. **Sweep Phase**:
+   - Sweeps unused objects back to free list.
+   - Compacts heap if fragmentation > threshold.
+4. **Resume**: Resumes paused threads.
+
+**Integration Algorithms**:
+
+**Handle Management (C <-> Lisp Bridge)**:
+
+- **Challenge**: C functions holding Lisp objects must prevent GC from collecting them.
+- **Solution**: "Handle Scope" pattern.
+  1.  On C entry: `scope = handle_scope_open()`.
+  2.  Use `handle_new(obj)` to wrap Lisp pointers.
+  3.  `handle_new` adds pointer to thread-local "Root Set".
+  4.  On exit: `handle_scope_close(scope)` pops all handles from Root Set.
+
+**Signal/Interrupt Safe Execution**:
+
+- Lisp VM checks `atomic_flag interrupt_pending` at every backward jump or function call.
+- If set:
+  _ Saves VM state.
+  _ Calls `process_interrupt_handler`. \* Restores VM state.
+  This ensures Kernel Lisp code can be interrupted by Hardware IRQs without corruption.
 
 ---
 
@@ -4117,55 +4420,100 @@ struct usb_hc {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-**USB Core**:
+#### 1. `usb_init`
 
-1. `usb_init(void)` - Initialize USB subsystem
-2. `usb_register_hc(struct usb_hc* hc)` - Register host controller
-3. `usb_unregister_hc(struct usb_hc* hc)` - Unregister host controller
-4. `usb_new_device(struct usb_hc* hc, struct usb_device* parent, int port, enum usb_speed speed)` - Enumerate new device
-5. `usb_disconnect_device(struct usb_device* dev)` - Disconnect device
-6. `usb_set_address(struct usb_device* dev, uint8_t address)` - Set device address
-7. `usb_get_descriptor(struct usb_device* dev, uint8_t type, uint8_t index, void* buf, size_t len)` - Get descriptor
-8. `usb_set_configuration(struct usb_device* dev, uint8_t config)` - Set configuration
-9. `usb_control_transfer(struct usb_device* dev, struct usb_request* req, void* buf, size_t len)` - Control transfer
-10. `usb_bulk_transfer(struct usb_device* dev, struct usb_endpoint* ep, void* buf, size_t len)` - Bulk transfer
-11. `usb_interrupt_transfer(struct usb_device* dev, struct usb_endpoint* ep, void* buf, size_t len, int interval)` - Interrupt transfer
+```c
+int usb_init(void);
+```
 
-**xHCI Driver**:
+**Description**:
+Initializes the USB Core Subsystem.
 
-1. `xhci_init(struct usb_hc* hc)` - Initialize xHCI controller
-2. `xhci_reset(struct usb_hc* hc)` - Reset controller
-3. `xhci_start(struct usb_hc* hc)` - Start controller
-4. `xhci_stop(struct usb_hc* hc)` - Stop controller
-5. `xhci_alloc_ring(struct xhci_ring* ring, int segments)` - Allocate transfer ring
-6. `xhci_free_ring(struct xhci_ring* ring)` - Free transfer ring
-7. `xhci_enqueue_trb(struct xhci_ring* ring, struct xhci_trb* trb)` - Enqueue TRB
-8. `xhci_handle_event(struct usb_hc* hc, struct xhci_trb* event)` - Handle event
-9. `xhci_address_device(struct usb_hc* hc, struct usb_device* dev)` - Address device
-10. `xhci_configure_endpoint(struct usb_hc* hc, struct usb_device* dev, struct usb_endpoint* ep)` - Configure endpoint
+1. Scans PCI bus for xHCI/EHCI/UHCI controllers.
+2. For each controller found:
+   - Maps MMIO bars.
+   - Allocates `usb_hc` structure.
+   - Calls `hc->ops->init(hc)`.
+   - Registers Root Hub.
+3. Launches `usb_enumerator_thread`.
 
-**USB Hub Driver**:
+#### 2. `usb_control_transfer`
 
-1. `usb_hub_init(struct usb_device* hub)` - Initialize hub
-2. `usb_hub_get_port_status(struct usb_device* hub, int port, uint32_t* status)` - Get port status
-3. `usb_hub_port_reset(struct usb_device* hub, int port)` - Reset port
-4. `usb_hub_port_power(struct usb_device* hub, int port, bool on)` - Power port
-5. `usb_hub_scan_ports(struct usb_device* hub)` - Scan for new devices
+```c
+int usb_control_transfer(struct usb_device* dev, struct usb_request* req, void* buf, size_t len);
+```
 
-**Device Enumeration Algorithm**:
+**Description**:
+Performs a synchronous Control Transfer on Endpoint 0.
 
-1. Detect device connection (port status change)
-2. Reset port
-3. Determine device speed
-4. Allocate device address
-5. Set device address (SET_ADDRESS request)
-6. Get device descriptor (GET_DESCRIPTOR request)
-7. Get configuration descriptor
-8. Set configuration (SET_CONFIGURATION request)
-9. Load appropriate class driver
-10. Bind driver to device
+1. Constructs Setup Packet (8 bytes).
+2. **Setup Stage**: Sends Setup Packet to device.
+3. **Data Stage**: If `len > 0`, sends/receives data payload (IN/OUT based on `req->type`).
+4. **Status Stage**: Performs 0-length handshake packet (IN if Data-OUT, OUT if Data-IN).
+5. returns bytes transferred or error code (STALL, TIMEOUT).
+
+#### 3. `xhci_enqueue_trb`
+
+```c
+int xhci_enqueue_trb(struct xhci_ring* ring, struct xhci_trb* trb);
+```
+
+**Description**:
+Adds a Transfer Request Block to the hardware ring.
+
+1. Copies TRB content to `ring->ring_base[ring->enqueue_ptr]`.
+2. Toggles Cycle Bit matching the Driver's Cycle State (PCS).
+3. Increments Enqueue Pointer.
+4. Logic for Ring Wrap-Around: If at end, insert Link TRB pointing to start.
+5. **Doorbell**: Writes to Doorbell Register to notify xHCI controller.
+
+#### 4. `usb_hub_scan_ports`
+
+```c
+int usb_hub_scan_ports(struct usb_device* hub);
+```
+
+**Description**:
+Polled or Interrupt-driven port scanner.
+
+1. Reads `PORT_STATUS` for all `hub->num_ports`.
+2. If `PORT_CONNECT_STATUS_CHANGE` bit set:
+   - Debounce port (wait 100ms).
+   - Read status again.
+   - If User Device: Trigger Enumeration.
+   - If Disconnect: Trigger Removal.
+3. Clears Change bits.
+
+**Detailed Algorithmic Specifications**:
+
+**USB Device Enumeration State Machine**:
+
+1.  **Detection**:
+    - Host detects device presence on Root Hub Port.
+    - Port Status indicates `CurrentConnectStatus = 1`.
+2.  **Reset**:
+    - Host issues `PortReset`. Drive bus to SE0 for 50ms.
+    - Device enters Default State (Address 0).
+3.  **Get Descriptor (MaxPacketSize)**:
+    - Send `GET_DESCRIPTOR_DEVICE` to Addr 0, Len 64.
+    - Device replies with first 8 bytes.
+    - Host extracts `bMaxPacketSize0` (8, 16, 32, or 64).
+    - Host updates Ep0 context.
+4.  **Set Address**:
+    - Host allocates new unique address `A` (1..127).
+    - Send `SET_ADDRESS(A)` to Addr 0.
+    - Device acknowledges. Device acts on Addr `A` henceforth.
+5.  **Get Full Descriptor**:
+    - Send `GET_DESCRIPTOR_DEVICE` to Addr `A` (Full length).
+    - Host parses VendorID, ProductID, Class.
+6.  **Configuration**:
+    - Send `GET_DESCRIPTOR_CONFIGURATION` (Head).
+    - Get TotalLength.
+    - Fetch User Configuration Blob (Config + Interfaces + Endpoints).
+    - Parse Interfaces and match against `usb_driver_list` (Driver Binding).
+    - Send `SET_CONFIGURATION`.
 
 ---
 
@@ -4540,6 +4888,283 @@ int acpi_enter_sleep_state(enum acpi_power_state state) {
 ```
 
 ---
+
+---
+
+### 7.4 Graphics Drivers - Complete Implementation
+
+#### Requirements
+
+- **VESA VBE**: Fallback linear framebuffer support.
+- **Intel Native**: Hardware acceleration for Intel HD Graphics (Gen 5+).
+- **Command Submission**: Ring buffer management for GPU commands.
+- **Memory Management**: GTT (Graphics Translation Table) handling.
+- **Hardware Cursor**: Hardware-managed cursor plane.
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* VESA VBE Mode Info */
+struct vbe_mode_info {
+    uint16_t attributes;
+    uint8_t window_a;
+    uint8_t window_b;
+    uint16_t granularity;
+    uint16_t window_size;
+    uint16_t segment_a;
+    uint16_t segment_b;
+    uint32_t win_func_ptr;
+    uint16_t pitch;
+    uint16_t width;
+    uint16_t height;
+    uint8_t w_char;
+    uint8_t y_char;
+    uint8_t planes;
+    uint8_t bpp;
+    uint8_t banks;
+    uint8_t memory_model;
+    uint8_t bank_size;
+    uint8_t image_pages;
+    uint8_t reserved1;
+    uint8_t red_mask_size;
+    uint8_t red_field_position;
+    uint8_t green_mask_size;
+    uint8_t green_field_position;
+    uint8_t blue_mask_size;
+    uint8_t blue_field_position;
+    uint8_t rsvd_mask_size;
+    uint8_t rsvd_field_position;
+    uint8_t direct_color_mode_info;
+    uint32_t phys_base;
+    uint32_t reserved2;
+    uint16_t reserved3;
+} __attribute__((packed));
+
+/* GPU Command Ring */
+struct gpu_ring {
+    uint32_t* virtual_base;
+    uint32_t length;        /* In bytes */
+    uint32_t head;          /* Offset */
+    uint32_t tail;          /* Offset */
+    uint32_t control_reg;   /* MMIO offset */
+    spinlock_t lock;
+};
+
+/* Intel GPU Context */
+struct intel_gpu {
+    struct pci_device* pci;
+    void* mmio_base;
+    uintptr_t gtt_base;
+    struct gpu_ring render_ring;
+    struct gpu_ring blitter_ring;
+    struct gpu_ring video_ring;
+
+    /* Display Planes */
+    struct display_plane* planes;
+    int num_planes;
+
+    /* Connectors */
+    struct gpu_connector* connectors;
+    int num_connectors;
+};
+```
+
+**Functions to Implement**:
+
+#### 1. `gpu_init_intel`
+
+```c
+int gpu_init_intel(struct pci_device* pci);
+```
+
+**Description**:
+Initializes Intel HD Graphics hardware.
+
+1. Enable Bus Mastering and Memory Access in PCI Command Register.
+2. Map MMIO BAR (BAR0) and GTT (often part of BAR0 or separate).
+3. Reset GPU Core (set/clear Reset bit in `GT_CTRL`).
+4. Initialize GTT (clear all entries to scratch page).
+5. Initialize Render Ring Buffer:
+   - Allocate 4KB aligned page.
+   - Write base address to `RCS_RING_BASE`.
+   - Set length in `RCS_RING_LEN`.
+   - Enable ring in `RCS_RING_CTL`.
+
+#### 2. `gpu_submit_command`
+
+```c
+int gpu_submit_command(struct gpu_ring* ring, uint32_t* batch, size_t count);
+```
+
+**Description**:
+Writes commands to the circular ring buffer.
+
+1. Acquire ring lock.
+2. Check for space: `(tail + size) % len != head`.
+3. If full, wait (poll head register).
+4. Copy `batch` commands to `ring->virtual_base + tail`.
+5. Update `tail = (tail + size * 4) % len`.
+6. Write new tail to `RING_TAIL` register.
+   - Note: Some HW requires cache flush or specific alignment.
+
+#### 3. `gpu_set_mode`
+
+```c
+int gpu_set_mode(struct intel_gpu* gpu, int width, int height, int bpp);
+```
+
+**Description**:
+Sets the display pipeline (Pipes, Transcoders, Planes).
+
+1. Disable Planes and Pipes.
+2. Configure PLLs (Frequencies) for target resolution dot clock.
+3. Configure Transcoder timings (HTotal, VTotal, Syncs).
+4. Enable Pipe.
+5. Configure Plane to scan out from Framebuffer address.
+6. Enable Plane.
+
+**Algorithmic Details**:
+
+**Dirty Rectangle Tracking (Software Fallback)**:
+
+1. Maintain a `dirty_region` list for the framebuffer.
+2. Drawing primitives (`rect`, `line`, `text`) union their bounds into `dirty_region`.
+3. `compositor_thread` wakes up on VSync.
+4. If `dirty_region` is not empty:
+   - Copy only dirty rects from Back Buffer to Front Buffer (VRAM).
+   - Or, issue Blit commands to GPU if available.
+   - Clear `dirty_region`.
+
+---
+
+### 7.5 Audio Drivers - Complete Implementation
+
+#### Requirements
+
+- **Intel HDA**: High Definition Audio specification support.
+- **AC'97**: Legacy support (optional, but good for VMs).
+- **Codec Parsing**: Widget graph traversal.
+- **PCM Streams**: Playback and Capture DMA engines.
+- **Mixing**: Software mixing of multiple streams.
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* HDA Controller Registers */
+#define HDA_GCAP      0x00
+#define HDA_VMIN      0x02
+#define HDA_VMAJ      0x03
+#define HDA_OUTPAY    0x04
+#define HDA_INPAY     0x06
+#define HDA_GCTL      0x08
+#define HDA_WAKEEN    0x0C
+#define HDA_STATESTS  0x0E
+#define HDA_INTCTL    0x20
+#define HDA_INTSTS    0x24
+#define HDA_WALCLK    0x30
+#define HDA_CORB_BASE 0x40
+#define HDA_RIRB_BASE 0x50
+
+/* HDA Stream Descriptor */
+struct hda_stream_desc {
+    uint32_t ctl_sts;   /* Control / Status */
+    uint32_t lpib;      /* Link Position in Buffer */
+    uint32_t cbl;       /* Cyclic Buffer Length */
+    uint32_t lvi;       /* Last Valid Index */
+    uint32_t fmt;       /* Format */
+    uint32_t bdl_lower; /* Buffer Descriptor List Base Lower */
+    uint32_t bdl_upper; /* Buffer Descriptor List Base Upper */
+};
+
+/* Buffer Descriptor List Entry */
+struct hda_bdle {
+    uint32_t lower_addr;
+    uint32_t upper_addr;
+    uint32_t length;
+    uint32_t flags;     /* IOC: Interrupt On Completion */
+} __attribute__((packed));
+
+struct hda_device {
+    uintptr_t base_addr;
+    uint32_t* corb_base;
+    uint64_t* rirb_base;
+    uint16_t corb_wp;
+    uint16_t rirb_rp;
+    int num_output_streams;
+    int num_input_streams;
+    struct hda_stream_desc* streams;
+};
+```
+
+**Functions to Implement**:
+
+#### 1. `hda_init`
+
+```c
+int hda_init(struct pci_device* pci);
+```
+
+**Description**:
+Initializes HDA Controller.
+
+1. Map MMIO.
+2. Reset Controller: Clear `CRST` bit in `GCTL`, wait, Set `CRST`, wait.
+3. Detect capabilities: Read `GCAP` (Number of streams).
+4. Initialize CORB (Command Outbound Ring Buffer) and RIRB (Response Inbound Ring Buffer).
+   - Allocate DMA buffers.
+   - Set `CORBLBASE` / `RIRBLBASE`.
+   - Start CORB/RIRB DMA engines.
+
+#### 2. `hda_send_verb`
+
+```c
+uint32_t hda_send_verb(struct hda_device* dev, uint32_t codec, uint32_t node, uint32_t payload);
+```
+
+**Description**:
+Sends a verb to a codec and waits for response.
+
+1. Construct 32-bit command: `(codec << 28) | (node << 20) | payload`.
+2. Write to `CORB[write_ptr]`.
+3. Increment `write_ptr`.
+4. Poll `RIRB` write pointer (hardware update) or interrupt.
+5. Read response from `RIRB[read_ptr]`.
+
+#### 3. `hda_setup_stream`
+
+```c
+int hda_setup_stream(struct hda_device* dev, int stream_id, struct pcm_buffer* buf);
+```
+
+**Description**:
+Configures a DMA stream for playback.
+
+1. Reset Stream: Set `SRST` bit in `SDnCTL`.
+2. Setup BDL (Buffer Descriptor List):
+   - Break linear buffer into physical pages.
+   - Create BDLEs for each page.
+3. Set Cyclic Buffer Length (`CBL`).
+4. Set Stream Format (`FMT`): 48kHz, 16-bit, Stereo (`0x4011`).
+5. Enable Stream: Set `RUN` bit.
+
+**Algorithmic Details**:
+
+**Codec Enumeration**:
+
+1. Read `STATESTS` register. Bits 0-15 indicate detected codecs.
+2. For each bit set (e.g., bit 0 -> Codec 0):
+   - Send `GET_PARAM(Root Node, VENDOR_ID)`.
+   - Send `GET_PARAM(Root Node, REVISION_ID)`.
+   - Parse Widget Graph:
+     - Start at Root Node.
+     - Enumerate Audio Function Groups.
+     - For each Group, enumerate Widgets (Pin Complex, DAC, ADC, Mixer).
+     - Find Path: DAC -> Mixer -> Pin Complex (Headphone/Line Out).
+     - Unmute all widgets in path.
 
 ## Phase 8: Testing and Quality Assurance (Months 22-24)
 
@@ -5027,21 +5652,122 @@ BENCHMARK(network, tcp_throughput, 100) {
 }
 ```
 
+**Detailed API Specification**:
+
+#### 1. `benchmark_run`
+
+```c
+struct benchmark_result benchmark_run(const char* name);
+```
+
+**Description**:
+Executes a registered benchmark.
+
+1. **Warmup**: Runs `setup` and performs 10% of iterations to warm instruction cache.
+2. **Measurement**:
+   - `start = rdtsc()`.
+   - Loop `iterations` times calling body.
+   - `end = rdtsc()`.
+3. **Analysis**:
+   - Computes `avg_cycles`, `ops_per_sec`.
+   - Stores result in linked list.
+
+#### 2. `profiler_report`
+
+```c
+void profiler_report(void);
+```
+
+**Description**:
+Dumps call graph and timing data.
+
+1. Walks the `profiler_entry` tree.
+2. For each node, prints:
+   - Function Name
+   - Call Count
+   - Total/Self/Children Time
+   - % of parent time
+3. Formats as hierarchical text or JSON for external tools (e.g., FlameGraph).
+
+---
+
+### 8.4 Kernel Fuzzing - Complete Implementation
+
+#### Requirements
+
+- **Coverage-Guided Fuzzing**: Integrate with KCOV-like interface
+- **Syzkaller Support**: Expose syscall descriptions
+- **Sanitizers**: KASAN (Address), KUBSAN (Undefined Behavior)
+- **Fault Injection**: Randomly fail allocations or IO
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+struct kcov_area {
+    uint64_t count;
+    uint64_t pcs[KCOV_MAX_PCS];
+};
+
+struct kasan_meta {
+    uint8_t shadow_byte; /* 0=Good, 0xFA=RedZone, 0xFD=Freed */
+};
+```
+
 **Functions to Implement**:
 
-1. `benchmark_init(void)` - Initialize benchmarking
-2. `benchmark_register(struct benchmark* bench)` - Register benchmark
-3. `benchmark_run_all(void)` - Run all benchmarks
-4. `benchmark_run(const char* name)` - Run specific benchmark
-5. `benchmark_compare(struct benchmark_result* a, struct benchmark_result* b)` - Compare results
-6. `profiler_start(void)` - Start profiling
-7. `profiler_stop(void)` - Stop profiling
-8. `profiler_enter(const char* function)` - Enter function
-9. `profiler_exit(const char* function)` - Exit function
-10. `profiler_report(void)` - Generate profiling report
-11. `memory_profile_start(void)` - Start memory profiling
-12. `memory_profile_stop(void)` - Stop memory profiling
-13. `memory_profile_report(void)` - Generate memory report
+1. `kcov_init(void)` - Initialize coverage tracker
+2. `kcov_remote_start(uint64_t handle)` - Start remote tracing
+3. `kcov_remote_stop(void)` - Stop remote tracing
+4. `__sanitizer_cov_trace_pc(void)` - Compiler hook for PC tracing
+5. `kasan_init(void)` - Initialize Shadow Memory (1/8th of RAM)
+6. `kasan_poison(void* addr, size_t size, uint8_t value)` - Poison memory range
+7. `kasan_unpoison(void* addr, size_t size)` - Mark memory as valid
+8. `kasan_report(uintptr_t addr, size_t size, bool write)` - Report violation
+
+**Fuzzing Strategy (Syzkaller Integration)**:
+
+1.  **Syscall Description**: Define AST for all 150+ syscalls in Syzkaller's `lang` format.
+    - `open(file ptr[in, string], flags flags[open_flags], mode const[0]) fd`
+2.  **Executor**: Implement a small userspace agent (`syz-executor`) that:
+    - Maps `kcov` file.
+    - Executes shared memory bytecode from Fuzzer.
+    - Feeds coverage back to Fuzzer.
+3.  **Reproducer**: Logic to re-run crashing inputs deterministically.
+
+---
+
+### 8.5 System Integration Scenarios - Detailed
+
+#### Scenario 1: Heavy Network Load (The 'C10K' Test)
+
+- **Setup**: Spawn 100 threads, each opening 100 connections to loopback server.
+- **Action**: Send 1KB random data ping-pong.
+- **Validation**:
+  - No kernel panic (OOM or Deadlock).
+  - All data verified via CRC32.
+  - Throughput > 1 Gbps loopback.
+  - No fd leaks (check `ls /proc/sys/fs/file-nr`).
+
+#### Scenario 2: Filesystem Journal Recovery
+
+- **Setup**: Mount LFSX. Start writing 1GB file.
+- **Action**: Hard Reset VM (simulated power loss) at 50% progress.
+- **Validation**:
+  - Mount LFSX.
+  - Journal Replay runs successfully.
+  - Filesystem consistent (fsck pass).
+  - Data up to last atomic commit is present.
+
+#### Scenario 3: Memory Pressure & Swapping
+
+- **Setup**: Limit RAM to 256MB.
+- **Action**: Spawn process allocating 512MB initialized data.
+- **Validation**:
+  - Swap file usage increases.
+  - No OOM Kill of critical services (Init, WindowServer).
+  - Process completes verify check of memory.
 
 ---
 
@@ -5069,73 +5795,57 @@ BENCHMARK(network, tcp_throughput, 100) {
 
 #### Documentation Format
 
-**API Documentation Template**:
-
-````markdown
-# function_name
-
-## Synopsis
+**API Documentation Template (Doxygen)**:
 
 ```c
+/**
+ * @brief Brief description of the function.
+ *
+ * Detailed description of the function's behavior, including
+ * side effects, thread safety guarantees, and algorithmic complexity.
+ *
+ * @param[in] param1 Description of input parameter.
+ * @param[out] param2 Description of output parameter.
+ * @return Description of return value.
+ * @retval 0 Success
+ * @retval -EINVAL Invalid argument
+ *
+ * @note Important usage notes.
+ * @warning Critical warnings.
+ */
 return_type function_name(param_type1 param1, param_type2 param2);
 ```
-````
 
-## Description
+**Architecture Decision Records (ADR)**:
 
-Detailed description of what the function does.
+- **Title**: Short noun phrase.
+- **Status**: Proposed, Accepted, Deprecated.
+- **Context**: What is the issue?
+- **Decision**: The change that we are making.
+- **Consequences**: Positive and negative impacts.
 
-## Parameters
+#### Man Page Generation
 
-- `param1`: Description of first parameter
-- `param2`: Description of second parameter
-
-## Return Value
-
-Description of return value, including error conditions.
-
-## Errors
-
-- `ERRNO1`: When this error occurs
-- `ERRNO2`: When this error occurs
-
-## Thread Safety
-
-Whether the function is thread-safe.
-
-## Example
-
-```c
-// Example usage
-int result = function_name(value1, value2);
-if (result < 0) {
-    // Handle error
-}
-```
-
-## See Also
-
-- `related_function1()`
-- `related_function2()`
-
-## Notes
-
-Any additional notes or caveats.
-
-````
+- Tools: `pandoc` or `ronn`.
+- Source: Markdown in `docs/man/`.
+- Output: Troff format installed to `/usr/share/man/`.
 
 **System Call Documentation**:
-```markdown
+
+````markdown
 # syscall_name(2)
 
 ## NAME
+
 syscall_name - brief description
 
 ## SYNOPSIS
+
 ```c
 #include <sys/syscall.h>
 
 long syscall_name(arg_type1 arg1, arg_type2 arg2);
+```
 ````
 
 ## DESCRIPTION
@@ -5182,6 +5892,73 @@ related_syscall(2), related_function(3)
 ---
 
 *Document continues with Phases 10-12...*
+
+
+### 9.2 Tutorials
+
+#### Tutorial 1: Writing a Hello World Driver
+
+**Goal**: Create a kernel module that prints to the debug log.
+
+**Steps**:
+
+1.  **Create Driver Structure**:
+    ```c
+    #include <kernel/driver.h>
+
+    static int hello_init(void) {
+        kprintf("Hello, Kernel World!\n");
+        return 0;
+    }
+
+    static void hello_exit(void) {
+        kprintf("Goodbye, Kernel World!\n");
+    }
+
+    struct driver hello_driver = {
+        .name = "hello",
+        .init = hello_init,
+        .exit = hello_exit,
+    };
+
+    DRIVER_EXPORT(hello_driver);
+    ```
+
+2.  **Build System**:
+    Add to `drivers/Makefile`:
+    ```makefile
+    obj-$(CONFIG_HELLO) += hello.o
+    ```
+
+3.  **Loading**:
+    In Lisp shell:
+    ```lisp
+    (kernel:load-module "hello")
+    ;; Output: Hello, Kernel World!
+    ```
+
+#### Tutorial 2: Creating a Lisp GUI Application
+
+**Goal**: Create a window with a button that clicks.
+
+**Code**:
+```lisp
+(defpackage :my-app
+  (:use :cl :ui))
+
+(in-package :my-app)
+
+(defun on-click (btn)
+  (ui:alert "Button Clicked!"))
+
+(defun main ()
+  (let ((win (ui:window :title "My App" :width 400 :height 300))
+        (btn (ui:button :text "Click Me" :on-click #'on-click)))
+    (ui:add-child win btn)
+    (ui:show win)))
+```
+
+---
 
 ## Phase 10: Advanced OS Features (Months 25-28)
 
@@ -5273,17 +6050,72 @@ struct ipi_message {
 };
 ````
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `smp_init(void)` - Initialize SMP subsystem
-2. `smp_boot_aps(void)` - Boot Application Processors
-3. `per_cpu_init(void)` - Initialize per-CPU data
-4. `get_cpu_data(void)` - Get current CPU data
-5. `spinlock_init(spinlock_t* lock)` - Initialize spinlock
-6. `spinlock_acquire(spinlock_t* lock)` - Acquire spinlock
-7. `spinlock_release(spinlock_t* lock)` - Release spinlock
-8. `send_ipi(uint32_t cpu_id, enum ipi_type type)` - Send IPI
-9. `handle_ipi(void)` - IPI interrupt handler
+#### 1. `smp_boot_aps`
+
+```c
+void smp_boot_aps(void);
+```
+
+**Description**:
+Boots Application Processors (APs).
+
+1. **Trampoline**: Copies 16-bit trampoline code to low memory (e.g., `0x8000`).
+2. **INIT IPI**: Sends INIT IPI to target core APIC ID.
+3. **Delay**: Waits 10ms.
+4. **SIPI**: Sends Start-Up IPI (SIPI) with vector `0x08` (Start at `0x8000`).
+5. **Wait**: Checks `cpu->online` flag.
+6. **Retry**: If not online, sends second SIPI.
+7. **Synchronization**: AP switches to 64-bit mode, loads IDT/GDT, enables paging, sets `online=true`.
+
+#### 2. `spinlock_acquire`
+
+```c
+void spinlock_acquire(spinlock_t* lock);
+```
+
+**Description**:
+Acquires a spinlock with deadlock detection.
+
+1. Disables interrupts (`cli`).
+2. `preempt_disable()`.
+3. **Fast Path**: `atomic_compare_exchange(lock->value, 0, 1)`.
+4. **Slow Path**:
+   - Loops while `lock->value != 0`.
+   - `cpu_relax()` (PAUSE instruction).
+   - Checks for deadlock timeout (debug mode).
+5. Sets `lock->owner = current_cpu`.
+
+#### 3. `send_ipi`
+
+```c
+void send_ipi(uint32_t cpu_id, enum ipi_type type);
+```
+
+**Description**:
+Sends Inter-Processor Interrupt.
+
+1. Locates `paca[cpu_id]`.
+2. Allocates `ipi_message` from ring buffer.
+3. Sets `msg->type = type`.
+4. Barriers: `smp_wmb()`.
+5. Writes `APIC_ICR_LOW` with `vector | (apic_id << 56)`.
+6. Waits for Delivery Status bit to clear.
+
+**Algorithmic Details**:
+
+**TLB Shootdown Protocol**:
+
+1. Initiator disables preemption.
+2. Sets `mm->tlb_flush_pending = mask` (target CPUs).
+3. Sends `IPI_TLB_FLUSH` to mask.
+4. While `mm->tlb_flush_pending != 0`:
+   - `cpu_relax()`.
+5. Enters Receiver:
+   - `flush_tlb()`.
+   - Atomically clears bit in `pending`.
+   - Sends ACK (implied by clearing bit).
 
 **Algorithmic Details**:
 
@@ -5349,11 +6181,69 @@ struct vcpu {
 
 **Functions to Implement**:
 
-1. `kvm_init(void)` - Check CPU support and enable VMX/SVM
-2. `vcpu_create(struct vm* vm)` - Create virtual CPU
-3. `vcpu_run(struct vcpu* vcpu)` - VM entry loop
-4. `vm_exit_handler(struct vcpu* vcpu)` - Handle VM exits
-5. `ept_map(struct vcpu* vcpu, uint64_t gpa, uint64_t hpa)` - Map memory
+**Detailed API Specification**:
+
+#### 1. `vm_run`
+
+```c
+int vm_run(struct vcpu* vcpu);
+```
+
+**Description**:
+Executes the VCPU loop.
+
+1. `vmptrld(vcpu->vmcs_phys)`.
+2. Restores GPRs from `vcpu->guest_regs`.
+3. `vmlaunch` (first time) or `vmresume` (subsequent).
+4. **VM Exit**: Hardware saves state to VMCS, jumps to HOST_RIP.
+5. Saves Guest GPRs to `vcpu->guest_regs`.
+6. Calls `handle_vmexit(vcpu)`.
+
+#### 2. `handle_vmexit`
+
+```c
+int handle_vmexit(struct vcpu* vcpu);
+```
+
+**Description**:
+Decodes VM Exit Reason and dispatches handler.
+
+- **CPUID**: Emulates CPUID instruction (returns host topology or masked features).
+- **IO_INSTRUCTION**: Emulates PIO (calls `io_handler`).
+- **EPT_VIOLATION**: Handles MMIO or Paging faults (Shadow Paging/EPT fill).
+- **CR_ACCESS**: Emulates MOV CRx (e.g., enable paging).
+- **MSR_READ/WRITE**: Emulates Model Specific Registers.
+- **HLT**: Yields CPU until interrupt.
+
+#### 3. `vm_map_phys`
+
+```c
+int vm_map_phys(struct vm* vm, uint64_t gpa, uint64_t hpa, uint64_t flags);
+```
+
+**Description**:
+Maps Guest Physical Address to Host Physical Address in EPT/NPT.
+
+1. Walks EPT PML4 -> PDPT -> PD -> PT.
+2. Allocates tables if missing.
+3. Sets PFN in Leaf Entry with correct permissions (Read/Write/Exec).
+4. Invalidates EPT TLB (`invept`).
+
+**Algorithmic Details**:
+
+**Instruction Emulation (PIO)**:
+
+1. Decode `EXIT_QUALIFICATION` to get Port, Size, Direction (In/Out).
+2. If `Out`: Read value from Guest RAX/EAX/AX/AL. Write to virtual device state.
+3. If `In`: Read from virtual device state. Write to Guest RAX...
+4. Advance Guest RIP by `VM_EXIT_INSTRUCTION_LEN`.
+
+**Interrupt Injection**:
+Before `vmresume`:
+
+1. Check if Guest RFLAGS.IF is set (Interruptible).
+2. Check if pending virtual interrupt exists.
+3. Write `VM_ENTRY_INTR_INFO_FIELD` in VMCS with Vector and Type (ExtInt).
 
 ### 10.3 Real-time Features - Complete Implementation
 
@@ -5392,6 +6282,172 @@ struct hrtimer {
 6. Make A inheritor of B's priority effectively.
 7. Recurse if A is blocked on another mutex.
 8. On unlock, restore A's original priority.
+
+---
+
+### 10.4 Containerization - Complete Implementation
+
+#### Requirements
+
+- **Namespaces**: Process ID (PID), Mount (MNT), Network (NET), UTS, IPC, User.
+- **Control Groups (cgroups)**: Resource limiting (CPU, Memory, IO).
+- **Layered Filesystem**: OverlayFS implementation.
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* Namespace Proxy */
+struct nsproxy {
+    atomic_t count;
+    struct uts_namespace* uts_ns;
+    struct ipc_namespace* ipc_ns;
+    struct mnt_namespace* mnt_ns;
+    struct pid_namespace* pid_ns;
+    struct net_namespace* net_ns;
+};
+
+/* CGroup Controller */
+struct cgroup_subsys_state {
+    struct cgroup* cgroup;
+    atomic_t refcnt;
+    unsigned long flags;
+    /* Controller specific data follows */
+};
+
+struct css_set {
+    atomic_t refcnt;
+    struct hlist_node hlist;
+    struct list_head tasks; /* Tasks in this cg */
+    struct cgroup_subsys_state* subsys[CGROUP_SUBSYS_COUNT];
+};
+```
+
+**Functions to Implement**:
+
+#### 1. `copy_namespaces`
+
+```c
+int copy_namespaces(unsigned long flags, struct task_struct* tsk);
+```
+
+**Description**:
+Called during `fork()`/`clone()`.
+
+1. If flags set (`CLONE_NEWPID`, etc.), allocate new namespace structures.
+2. Initialize new namespace (e.g., PID NS creates new ID allocator).
+3. If flags not set, increment refcount on parent's namespaces.
+4. Attach `nsproxy` to new task.
+
+#### 2. `cgroup_attach_task`
+
+```c
+int cgroup_attach_task(struct cgroup* cgrp, struct task_struct* tsk);
+```
+
+**Description**:
+Moves a task into a cgroup.
+
+1. Lock `css_set_lock`.
+2. Find existing `css_set` linking to `cgrp`.
+3. If not exists, allocate new `css_set`.
+4. Migrate task to new `css_set`.
+5. Call controller APIs (e.g., `cpu_cgroup_attach`) to update accounting.
+
+**Algorithmic Details**:
+
+**PID Namespace Translation**:
+
+1. Global PID: Unique ID in kernel.
+2. Virtual PID: ID seen by process.
+3. `task_pid_vnr(task)`:
+   - Walk up namespace hierarchy from `task->nsproxy->pid_ns`.
+   - Find mapping for `task`.
+   - Return local ID.
+
+---
+
+### 10.4 Containerization - Complete Implementation
+
+#### Requirements
+
+- **Namespaces**: Process ID (PID), Mount (MNT), Network (NET), UTS, IPC, User.
+- **Control Groups (cgroups)**: Resource limiting (CPU, Memory, IO).
+- **Layered Filesystem**: OverlayFS implementation.
+
+#### Implementation Details
+
+**Data Structures**:
+
+```c
+/* Namespace Proxy */
+struct nsproxy {
+    atomic_t count;
+    struct uts_namespace* uts_ns;
+    struct ipc_namespace* ipc_ns;
+    struct mnt_namespace* mnt_ns;
+    struct pid_namespace* pid_ns;
+    struct net_namespace* net_ns;
+};
+
+/* CGroup Controller */
+struct cgroup_subsys_state {
+    struct cgroup* cgroup;
+    atomic_t refcnt;
+    unsigned long flags;
+    /* Controller specific data follows */
+};
+
+struct css_set {
+    atomic_t refcnt;
+    struct hlist_node hlist;
+    struct list_head tasks; /* Tasks in this cg */
+    struct cgroup_subsys_state* subsys[CGROUP_SUBSYS_COUNT];
+};
+```
+
+**Functions to Implement**:
+
+#### 1. `copy_namespaces`
+
+```c
+int copy_namespaces(unsigned long flags, struct task_struct* tsk);
+```
+
+**Description**:
+Called during `fork()`/`clone()`.
+
+1. If flags set (`CLONE_NEWPID`, etc.), allocate new namespace structures.
+2. Initialize new namespace (e.g., PID NS creates new ID allocator).
+3. If flags not set, increment refcount on parent's namespaces.
+4. Attach `nsproxy` to new task.
+
+#### 2. `cgroup_attach_task`
+
+```c
+int cgroup_attach_task(struct cgroup* cgrp, struct task_struct* tsk);
+```
+
+**Description**:
+Moves a task into a cgroup.
+
+1. Lock `css_set_lock`.
+2. Find existing `css_set` linking to `cgrp`.
+3. If not exists, allocate new `css_set`.
+4. Migrate task to new `css_set`.
+5. Call controller APIs (e.g., `cpu_cgroup_attach`) to update accounting.
+
+**Algorithmic Details**:
+
+**PID Namespace Translation**:
+
+1. Global PID: Unique ID in kernel.
+2. Virtual PID: ID seen by process.
+3. `task_pid_vnr(task)`:
+   - Walk up namespace hierarchy from `task->nsproxy->pid_ns`.
+   - Find mapping for `task`.
+   - Return local ID.
 
 ---
 
@@ -5470,24 +6526,104 @@ struct transaction_step {
 };
 ```
 
-**Functions to Implement**:
+**Detailed API Specification**:
 
-1. `pkg_load_metadata(const char* path)` - Parse package metadata
-2. `pkg_verify_signature(const char* path, uint8_t* pubkey)` - Verify security
-3. `pkg_solve_dependencies(const char* target, struct repository* repo)` - Create transaction
-4. `pkg_execute_transaction(struct transaction_step* steps)` - Apply changes
-5. `pkg_database_add(struct package_metadata* pkg)` - Update local DB
+#### 1. `pkg_solve_dependencies`
 
-**Dependency Resolution Algorithm (SAT-inspired)**:
+```c
+struct transaction* pkg_solve_dependencies(const char* target, struct repository* repo);
+```
 
-1. Create a goal: "Install PkgA".
-2. Add PkgA dependencies to the queue.
-3. For each dependency, find candidates in repositories.
-4. Filter candidates by version constraints.
-5. If multiple candidates, pick highest version (heuristic).
-6. If conflict detected (e.g., PkgB conflicts with PkgC), backtrack or error.
-7. Build a directed acyclic graph (DAG) of the solution.
-8. Topological sort the DAG to determine install order.
+**Description**:
+Resolves dependencies using a SAT solver approach.
+
+1. **Clause Generation**:
+   - For every package `P` in repo:
+     - `Install(P) -> Install(Dep1) AND Install(Dep2)...`.
+     - `Install(P) -> NOT Install(Conflict1)`.
+   - Add user goal: `Install(Target)`.
+2. **Solver Execution**:
+   - Uses CDCL (Conflict-Driven Clause Learning) solver.
+   - Finds an assignment of True/False to all `Install(P)` variables.
+3. **Transaction Build**:
+   - Collects all variables assigned True.
+   - Sorts them topologically based on dependency graph.
+   - Returns list of `INSTALL` steps.
+
+#### 2. `pkg_verify_signature`
+
+```c
+int pkg_verify_signature(const char* path, uint8_t* pubkey);
+```
+
+**Description**:
+Verifies the Ed25519 signature of a package.
+
+1. Reads the last 64 bytes of the `.apk` file (The signature).
+2. Hashes the rest of the file using BLAKE3.
+3. Calls `ed25519_verify(signature, hash, pubkey)`.
+4. Returns 0 if valid, -1 if invalid.
+
+**Algorithmic Details**:
+
+**Repository Indexing**:
+
+1. Crawl directory of `.apk` files.
+2. Extract `metadata.toml` from each.
+3. Aggregate into `index.json`.
+4. Sign `index.json` with GPG private key.
+5. Clients download `index.json` + `index.json.sig`.
+
+**Detailed System Installer Logic**:
+
+**Partitioning (GPT)**:
+
+1. `wipe_disk(device)`: Write zeros to first/last 1MB.
+2. `create_gpt_header()`: UUID generation, CRC32.
+3. `add_partition(EFI, 512MB, FAT32)`.
+4. `add_partition(ROOT, Remaining, LFSX)`.
+
+**Bootstrap Process**:
+
+1. Mount `/mnt/root` and `/mnt/root/boot/efi`.
+2. `pkg_install_root("/mnt/root", "base-system")`.
+   - Unpacks packages to target chroot.
+   - Runs `post_install` scripts inside chroot (using `chroot` or namespace isolation).
+3. `config_gen_fstab()`.
+4. `install_bootloader()`.
+
+---
+
+## Phase 12: Future Architecture (Months 33-36)
+
+### 12.1 Microkernel Migration Strategy
+
+#### Goals
+
+- **Fault Isolation**: Drivers in userspace.
+- **Message Passing**: Fast IPC (L4-style).
+- **Capability Security**: Object-capability model.
+
+#### Proposed Architecture (AstraLisp Micro)
+
+1.  **Nano-Kernel**: Handles threading, IPC, and MMU only. (< 10k LOC).
+2.  **User-Space Drivers**:
+    - `pci_server`: Enumerates bus, grants MMIO access to driver processes.
+    - `disk_driver`: Talks to NVMe, exposes block IPC interface.
+    - `net_driver`: Talks to NIC, exposes packet IPC interface.
+3.  **Lisp Runtime**: runs as a "System Server" managing the object graph.
+
+### 12.2 Distributed AstraLisp
+
+#### Concept
+
+Transform the OS into a Single System Image (SSI) cluster.
+
+#### Implementation
+
+1.  **Remote Object References**: Lisp pointers that refer to objects on another node.
+2.  **Network Paging**: Valid pages can be fetched from remote RAM (RDMA).
+3.  **Process Migration**: Serializing a running thread (stack + heap closure) and resuming on another node.
 
 ### 11.2 System Installer - Complete Implementation
 
@@ -5596,6 +6732,250 @@ struct global_ref {
 
 This roadmap provides a comprehensive path to a production-grade Operating System.
 
-```
+---
 
-```
+# Appendices
+
+## Appendix A: System Call Reference
+
+This section defines the ABI for all kernel system calls.
+
+| ID  | Name | Signature | Description |
+| --- | ---- | --------- | ----------- |
+| 0   | `sys_exit` | `void exit(int status)` | Terminate the calling process. |
+| 1   | `sys_fork` | `pid_t fork(void)` | Create a child process. |
+| 2   | `sys_read` | `ssize_t read(int fd, void *buf, size_t count)` | Read from a file descriptor. |
+| 3   | `sys_write` | `ssize_t write(int fd, const void *buf, size_t count)` | Write to a file descriptor. |
+| 4   | `sys_open` | `int open(const char *pathname, int flags, mode_t mode)` | Open a file. |
+| 5   | `sys_close` | `int close(int fd)` | Close a file descriptor. |
+| 6   | `sys_waitpid` | `pid_t waitpid(pid_t pid, int *status, int options)` | Wait for process change. |
+| 7   | `sys_creat` | `int creat(const char *pathname, mode_t mode)` | Create a file. |
+| 8   | `sys_link` | `int link(const char *oldpath, const char *newpath)` | Make a new name for a file. |
+| 9   | `sys_unlink` | `int unlink(const char *pathname)` | Delete a name and possibly the file. |
+| 10  | `sys_execve` | `int execve(const char *filename, char *const argv[], char *const envp[])` | Execute program. |
+| 11  | `sys_chdir` | `int chdir(const char *path)` | Change working directory. |
+| 12  | `sys_time` | `time_t time(time_t *tloc)` | Get time in seconds. |
+| 13  | `sys_mknod` | `int mknod(const char *pathname, mode_t mode, dev_t dev)` | Create directory/special file. |
+| 14  | `sys_chmod` | `int chmod(const char *pathname, mode_t mode)` | Change permissions of a file. |
+| 15  | `sys_lchown` | `int lchown(const char *pathname, uid_t owner, gid_t group)` | Change ownership of a file. |
+| 16  | `sys_stat` | `int stat(const char *pathname, struct stat *statbuf)` | Get file status. |
+| 17  | `sys_lseek` | `off_t lseek(int fd, off_t offset, int whence)` | Reposition read/write offset. |
+| 18  | `sys_getpid` | `pid_t getpid(void)` | Get process identity. |
+| 19  | `sys_mount` | `int mount(const char *source, const char *target, const char *filesystemtype, unsigned long mountflags, const void *data)` | Mount filesystem. |
+| 20  | `sys_umount` | `int umount(const char *target)` | Unmount filesystem. |
+| 21  | `sys_setuid` | `int setuid(uid_t uid)` | Set user identity. |
+| 22  | `sys_getuid` | `uid_t getuid(void)` | Get user identity. |
+| 23  | `sys_stime` | `int stime(const time_t *t)` | Set system time. |
+| 24  | `sys_ptrace` | `long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data)` | Process trace. |
+| 25  | `sys_alarm` | `unsigned int alarm(unsigned int seconds)` | Schedule an alarm signal. |
+| 26  | `sys_fstat` | `int fstat(int fd, struct stat *statbuf)` | Get file status (fd). |
+| 27  | `sys_pause` | `int pause(void)` | Wait for signal. |
+| 28  | `sys_utime` | `int utime(const char *filename, const struct utimbuf *times)` | Change file last access/mod times. |
+| 29  | `sys_access` | `int access(const char *pathname, int mode)` | Check user's permissions for a file. |
+| 30  | `sys_nice` | `int nice(int inc)` | Change process priority. |
+| 31  | `sys_sync` | `void sync(void)` | Commit buffer cache to disk. |
+| 32  | `sys_kill` | `int kill(pid_t pid, int sig)` | Send signal to a process. |
+| 33  | `sys_rename` | `int rename(const char *oldpath, const char *newpath)` | Change location/name of a file. |
+| 34  | `sys_mkdir` | `int mkdir(const char *pathname, mode_t mode)` | Create a directory. |
+| 35  | `sys_rmdir` | `int rmdir(const char *pathname)` | Delete a directory. |
+| 36  | `sys_dup` | `int dup(int oldfd)` | Duplicate a file descriptor. |
+| 37  | `sys_pipe` | `int pipe(int pipefd[2])` | Create pipe. |
+| 38  | `sys_times` | `clock_t times(struct tms *buf)` | Get process times. |
+| 39  | `sys_brk` | `int brk(void *addr)` | Change data segment size. |
+| 40  | `sys_setgid` | `int setgid(gid_t gid)` | Set group identity. |
+| 41  | `sys_getgid` | `gid_t getgid(void)` | Get group identity. |
+| 42  | `sys_signal` | `sighandler_t signal(int signum, sighandler_t handler)` | ANSI C signal handling. |
+| 43  | `sys_geteuid` | `uid_t geteuid(void)` | Get effective user identity. |
+| 44  | `sys_getegid` | `gid_t getegid(void)` | Get effective group identity. |
+| 45  | `sys_acct` | `int acct(const char *filename)` | Switch process accounting on/off. |
+| 46  | `sys_ioctl` | `int ioctl(int fd, unsigned long request, ...)` | Control device. |
+| 47  | `sys_fcntl` | `int fcntl(int fd, int cmd, ...)` | Manipulate file descriptor. |
+| 48  | `sys_setpgid` | `int setpgid(pid_t pid, pid_t pgid)` | Set process group ID. |
+| 49  | `sys_umask` | `mode_t umask(mode_t mask)` | Set file mode creation mask. |
+| 50  | `sys_chroot` | `int chroot(const char *path)` | Change root directory. |
+| 51  | `sys_ustat` | `int ustat(dev_t dev, struct ustat *ubuf)` | Get filesystem statistics. |
+| 52  | `sys_dup2` | `int dup2(int oldfd, int newfd)` | Duplicate a file descriptor. |
+| 53  | `sys_getppid` | `pid_t getppid(void)` | Get parent process ID. |
+| 54  | `sys_getpgrp` | `pid_t getpgrp(void)` | Get process group ID. |
+| 55  | `sys_setsid` | `pid_t setsid(void)` | Create session and set process group ID. |
+| 56  | `sys_sigaction` | `int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)` | Examine and change signal action. |
+| 57  | `sys_sgetmask` | `int sgetmask(void)` | Get signal mask (obsolete). |
+| 58  | `sys_ssetmask` | `int ssetmask(int newmask)` | Set signal mask (obsolete). |
+| 59  | `sys_setreuid` | `int setreuid(uid_t ruid, uid_t euid)` | Set real and/or effective user ID. |
+| 60  | `sys_setregid` | `int setregid(gid_t rgid, gid_t egid)` | Set real and/or effective group ID. |
+| 61  | `sys_sigsuspend` | `int sigsuspend(const sigset_t *mask)` | Wait for a signal. |
+| 62  | `sys_sigpending` | `int sigpending(sigset_t *set)` | Examine pending signals. |
+| 63  | `sys_sethostname` | `int sethostname(const char *name, size_t len)` | Set hostname. |
+| 64  | `sys_setrlimit` | `int setrlimit(int resource, const struct rlimit *rlim)` | Set resource limits. |
+| 65  | `sys_getrlimit` | `int getrlimit(int resource, struct rlimit *rlim)` | Get resource limits. |
+| 66  | `sys_getrusage` | `int getrusage(int who, struct rusage *usage)` | Get resource usage. |
+| 67  | `sys_gettimeofday` | `int gettimeofday(struct timeval *tv, struct timezone *tz)` | Get time. |
+| 68  | `sys_settimeofday` | `int settimeofday(const struct timeval *tv, const struct timezone *tz)` | Set time. |
+| 69  | `sys_getgroups` | `int getgroups(int size, gid_t list[])` | Get supplementary group IDs. |
+| 70  | `sys_setgroups` | `int setgroups(size_t size, const gid_t *list)` | Set supplementary group IDs. |
+| 71  | `sys_select` | `int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)` | Synchronous I/O multiplexing. |
+| 72  | `sys_symlink` | `int symlink(const char *target, const char *linkpath)` | Make a new name for a file. |
+| 73  | `sys_lstat` | `int lstat(const char *pathname, struct stat *statbuf)` | Get file status. |
+| 74  | `sys_readlink` | `ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)` | Read value of a symbolic link. |
+| 75  | `sys_uselib` | `int uselib(const char *library)` | Select shared library. |
+| 76  | `sys_swapon` | `int swapon(const char *path, int swapflags)` | Start/stop swapping to file/device. |
+| 77  | `sys_reboot` | `int reboot(int magic, int magic2, int cmd, void *arg)` | Reboot or enable/disable Ctrl-Alt-Del. |
+| 78  | `sys_readdir` | `int readdir(unsigned int fd, struct old_linux_dirent *dirp, unsigned int count)` | Read directory entry. |
+| 79  | `sys_mmap` | `void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)` | Map files or devices into memory. |
+| 80  | `sys_munmap` | `int munmap(void *addr, size_t length)` | Unmap files or devices. |
+| 81  | `sys_truncate` | `int truncate(const char *path, off_t length)` | Truncate a file to a specified length. |
+| 82  | `sys_ftruncate` | `int ftruncate(int fd, off_t length)` | Truncate a file to a specified length. |
+| 83  | `sys_fchmod` | `int fchmod(int fd, mode_t mode)` | Change permissions of a file. |
+| 84  | `sys_fchown` | `int fchown(int fd, uid_t owner, gid_t group)` | Change ownership of a file. |
+| 85  | `sys_getpriority` | `int getpriority(int which, id_t who)` | Get program scheduling priority. |
+| 86  | `sys_setpriority` | `int setpriority(int which, id_t who, int prio)` | Set program scheduling priority. |
+| 87  | `sys_statfs` | `int statfs(const char *path, struct statfs *buf)` | Get filesystem statistics. |
+| 88  | `sys_fstatfs` | `int fstatfs(int fd, struct statfs *buf)` | Get filesystem statistics. |
+| 89  | `sys_ioperm` | `int ioperm(unsigned long from, unsigned long num, int turn_on)` | Set port input/output permissions. |
+| 90  | `sys_socketcall` | `int socketcall(int call, unsigned long *args)` | Socket system calls (multiplexer). |
+| 91  | `sys_syslog` | `int syslog(int type, char *bufp, int len)` | Read and/or clear kernel message ring buffer. |
+| 92  | `sys_setitimer` | `int setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value)` | Set value of an interval timer. |
+| 93  | `sys_getitimer` | `int getitimer(int which, struct itimerval *curr_value)` | Get value of an interval timer. |
+| 94  | `sys_newstat` | `int newstat(const char *pathname, struct stat *statbuf)` | Get file status. |
+| 95  | `sys_newlstat` | `int newlstat(const char *pathname, struct stat *statbuf)` | Get file status. |
+| 96  | `sys_newfstat` | `int newfstat(int fd, struct stat *statbuf)` | Get file status. |
+| 97  | `sys_uname` | `int uname(struct utsname *buf)` | Get name and information about current kernel. |
+| 98  | `sys_iopl` | `int iopl(int level)` | Change I/O privilege level. |
+| 99  | `sys_vhangup` | `int vhangup(void)` | Virtually hangup the current terminal. |
+
+## Appendix B: Error Codes
+
+List of all standard `errno` values returned by system calls.
+
+| Code | Name | Description |
+| ---- | ---- | ----------- |
+| 1 | `EPERM` | Operation not permitted |
+| 2 | `ENOENT` | No such file or directory |
+| 3 | `ESRCH` | No such process |
+| 4 | `EINTR` | Interrupted system call |
+| 5 | `EIO` | I/O error |
+| 6 | `ENXIO` | No such device or address |
+| 7 | `E2BIG` | Argument list too long |
+| 8 | `ENOEXEC` | Exec format error |
+| 9 | `EBADF` | Bad file number |
+| 10 | `ECHILD` | No child processes |
+| 11 | `EAGAIN` | Try again |
+| 12 | `ENOMEM` | Out of memory |
+| 13 | `EACCES` | Permission denied |
+| 14 | `EFAULT` | Bad address |
+| 15 | `ENOTBLK` | Block device required |
+| 16 | `EBUSY` | Device or resource busy |
+| 17 | `EEXIST` | File exists |
+| 18 | `EXDEV` | Cross-device link |
+| 19 | `ENODEV` | No such device |
+| 20 | `ENOTDIR` | Not a directory |
+| 21 | `EISDIR` | Is a directory |
+| 22 | `EINVAL` | Invalid argument |
+| 23 | `ENFILE` | File table overflow |
+| 24 | `EMFILE` | Too many open files |
+| 25 | `ENOTTY` | Not a typewriter |
+| 26 | `ETXTBSY` | Text file busy |
+| 27 | `EFBIG` | File too large |
+| 28 | `ENOSPC` | No space left on device |
+| 29 | `ESPIPE` | Illegal seek |
+| 30 | `EROFS` | Read-only file system |
+| 31 | `EMLINK` | Too many links |
+| 32 | `EPIPE` | Broken pipe |
+| 33 | `EDOM` | Math argument out of domain of func |
+| 34 | `ERANGE` | Math result not representable |
+| 35 | `EDEADLK` | Resource deadlock would occur |
+| 36 | `ENAMETOOLONG` | File name too long |
+| 37 | `ENOLCK` | No record locks available |
+| 38 | `ENOSYS` | Function not implemented |
+| 39 | `ENOTEMPTY` | Directory not empty |
+| 40 | `ELOOP` | Too many symbolic links encountered |
+| 42 | `ENOMSG` | No message of desired type |
+| 43 | `EIDRM` | Identifier removed |
+| 44 | `ECHRNG` | Channel number out of range |
+| 45 | `EL2NSYNC` | Level 2 not synchronized |
+| 46 | `EL3HLT` | Level 3 halted |
+| 47 | `EL3RST` | Level 3 reset |
+| 48 | `ELNRNG` | Link number out of range |
+| 49 | `EUNATCH` | Protocol driver not attached |
+| 50 | `ENOCSI` | No CSI structure available |
+| 51 | `EL2HLT` | Level 2 halted |
+| 52 | `EBADE` | Invalid exchange |
+| 53 | `EBADR` | Invalid request descriptor |
+| 54 | `EXFULL` | Exchange full |
+| 55 | `ENOANO` | No anode |
+| 56 | `EBADRQC` | Invalid request code |
+| 57 | `EBADSLT` | Invalid slot |
+| 59 | `EBFONT` | Bad font file format |
+| 60 | `ENOSTR` | Device not a stream |
+| 61 | `ENODATA` | No data available |
+| 62 | `ETIME` | Timer expired |
+| 63 | `ENOSR` | Out of streams resources |
+| 64 | `ENONET` | Machine is not on the network |
+| 65 | `ENOPKG` | Package not installed |
+| 66 | `EREMOTE` | Object is remote |
+| 67 | `ENOLINK` | Link has been severed |
+| 68 | `EADV` | Advertise error |
+| 69 | `ESRMNT` | Srmount error |
+| 70 | `ECOMM` | Communication error on send |
+| 71 | `EPROTO` | Protocol error |
+| 72 | `EMULTIHOP` | Multihop attempted |
+| 73 | `EDOTDOT` | RFS specific error |
+| 74 | `EBADMSG` | Not a data message |
+| 75 | `EOVERFLOW` | Value too large for defined data type |
+| 76 | `ENOTUNIQ` | Name not unique on network |
+| 77 | `EBADFD` | File descriptor in bad state |
+| 78 | `EREMCHG` | Remote address changed |
+| 79 | `ELIBACC` | Can not access a needed shared library |
+| 80 | `ELIBBAD` | Accessing a corrupted shared library |
+| 81 | `ELIBSCN` | .lib section in a.out corrupted |
+| 82 | `ELIBMAX` | Attempting to link in too many shared libraries |
+| 83 | `ELIBEXEC` | Cannot exec a shared library directly |
+| 84 | `EILSEQ` | Illegal byte sequence |
+| 85 | `ERESTART` | Interrupted system call should be restarted |
+| 86 | `ESTRPIPE` | Streams pipe error |
+| 87 | `EUSERS` | Too many users |
+| 88 | `ENOTSOCK` | Socket operation on non-socket |
+| 89 | `EDESTADDRREQ` | Destination address required |
+| 90 | `EMSGSIZE` | Message too long |
+| 91 | `EPROTOTYPE` | Protocol wrong type for socket |
+| 92 | `ENOPROTOOPT` | Protocol not available |
+| 93 | `EPROTONOSUPPORT` | Protocol not supported |
+| 94 | `ESOCKTNOSUPPORT` | Socket type not supported |
+| 95 | `EOPNOTSUPP` | Operation not supported on transport endpoint |
+| 96 | `EPFNOSUPPORT` | Protocol family not supported |
+| 97 | `EAFNOSUPPORT` | Address family not supported by protocol |
+| 98 | `EADDRINUSE` | Address already in use |
+| 99 | `EADDRNOTAVAIL` | Cannot assign requested address |
+| 100 | `ENETDOWN` | Network is down |
+| 101 | `ENETUNREACH` | Network is unreachable |
+| 102 | `ENETRESET` | Network dropped connection because of reset |
+| 103 | `ECONNABORTED` | Software caused connection abort |
+| 104 | `ECONNRESET` | Connection reset by peer |
+| 105 | `ENOBUFS` | No buffer space available |
+| 106 | `EISCONN` | Transport endpoint is already connected |
+| 107 | `ENOTCONN` | Transport endpoint is not connected |
+| 108 | `ESHUTDOWN` | Cannot send after transport endpoint shutdown |
+| 109 | `ETOOMANYREFS` | Too many references: cannot splice |
+| 110 | `ETIMEDOUT` | Connection timed out |
+| 111 | `ECONNREFUSED` | Connection refused |
+| 112 | `EHOSTDOWN` | Host is down |
+| 113 | `EHOSTUNREACH` | No route to host |
+| 114 | `EALREADY` | Operation already in progress |
+| 115 | `EINPROGRESS` | Operation now in progress |
+| 116 | `ESTALE` | Stale file handle |
+| 117 | `EUCLEAN` | Structure needs cleaning |
+| 118 | `ENOTNAM` | Not a XENIX named type file |
+| 119 | `ENAVAIL` | No XENIX semaphores available |
+| 120 | `EISNAM` | Is a named type file |
+| 121 | `EREMOTEIO` | Remote I/O error |
+| 122 | `EDQUOT` | Quota exceeded |
+| 123 | `ENOMEDIUM` | No medium found |
+| 124 | `EMEDIUMTYPE` | Wrong medium type |
+| 125 | `ECANCELED` | Operation Canceled |
+| 126 | `ENOKEY` | Required key not available |
+| 127 | `EKEYEXPIRED` | Key has expired |
+| 128 | `EKEYREVOKED` | Key has been revoked |
+| 129 | `EKEYREJECTED` | Key was rejected by service |
+| 130 | `EOWNERDEAD` | Owner died |
+| 131 | `ENOTRECOVERABLE` | State not recoverable |
+
