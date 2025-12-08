@@ -12,7 +12,7 @@
 
 /* Runqueues for each priority level */
 static struct thread* runqueues[MAX_PRIORITIES] = {NULL};
-static struct thread* current_thread = NULL;
+/* current_thread is defined in process.c and extern in process.h */
 static struct thread* idle_thread = NULL;
 static uint64_t tick_count = 0;
 

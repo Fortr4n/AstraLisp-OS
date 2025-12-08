@@ -156,6 +156,14 @@ static int virtio_net_add_rx_buffer(struct virtio_net_device* dev) {
     return 0;
 }
 
+/* Simple pseudo-random generator for fallback MAC */
+/* In production, link to kernel CSPRNG */
+static uint32_t net_rng_state = 0xDEADBEEF;
+static uint8_t get_random_byte(void) {
+    net_rng_state = net_rng_state * 1103515245 + 12345;
+    return (uint8_t)(net_rng_state >> 16);
+}
+
 /* Initialize VirtIO net device */
 int virtio_net_init(struct virtio_net_device* dev, volatile void* bar0) {
     if (!dev || !bar0) return -1;
@@ -173,6 +181,12 @@ int virtio_net_init(struct virtio_net_device* dev, volatile void* bar0) {
     
     /* Negotiate features */
     uint32_t host_features = virtio_read32(dev, VIRTIO_PCI_HOST_FEATURES);
+    
+    /* Validate critically needed features */
+    if (!(host_features & VIRTIO_NET_F_MAC)) {
+        /* Warn: No hardware MAC */
+    }
+    
     dev->features = host_features & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
     virtio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, dev->features);
     
@@ -182,13 +196,14 @@ int virtio_net_init(struct virtio_net_device* dev, volatile void* bar0) {
             dev->mac[i] = virtio_read8(dev, VIRTIO_PCI_CONFIG + i);
         }
     } else {
-        /* Generate random MAC */
-        dev->mac[0] = 0x52;
-        dev->mac[1] = 0x54;
-        dev->mac[2] = 0x00;
-        dev->mac[3] = 0x12;
-        dev->mac[4] = 0x34;
-        dev->mac[5] = 0x56;
+        /* Generate valid local unicast MAC */
+        /* x2:xx:xx:xx:xx:xx is locally administered */
+        dev->mac[0] = 0x02; 
+        dev->mac[1] = get_random_byte();
+        dev->mac[2] = get_random_byte();
+        dev->mac[3] = get_random_byte();
+        dev->mac[4] = get_random_byte();
+        dev->mac[5] = get_random_byte();
     }
     
     dev->mtu = 1500;
@@ -207,6 +222,12 @@ int virtio_net_init(struct virtio_net_device* dev, volatile void* bar0) {
     
     /* Features OK */
     virtio_write8(dev, VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+    
+    /* Re-read status to confirm device accepted features */
+    uint8_t status = virtio_read8(dev, VIRTIO_PCI_STATUS);
+    if (!(status & VIRTIO_STATUS_FEATURES_OK)) {
+        return -1;
+    }
     
     /* Driver OK */
     virtio_write8(dev, VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);

@@ -791,9 +791,8 @@ struct lisp_object* kernel_vfs_stat(struct lisp_object* path) {
     /* Using lfsx_open to probe */
     struct lfsx_file* file = lfsx_open(path_str, 0);
     if (file) {
-        /* In real LFSX, file struct has size. Assuming generic accessor exists or using open/close as probe */
-        /* Construct a simple stat list */
-        struct lisp_object* size = lisp_create_integer(1024); /* Placeholder for actual size if private */
+        /* Get real file size */
+        struct lisp_object* size = lisp_create_integer(file->inode->size);
         struct lisp_object* type = lisp_create_integer(1); /* file */
         
         lfsx_close(file);

@@ -22,10 +22,9 @@
 /* Initialize virtual memory manager */
 int vmm_init(void);
 
-/* Create a new page directory */
+/* Create/Clone/Destroy Pagedir */
 void* vmm_create_pagedir(void);
-
-/* Destroy a page directory */
+void* vmm_clone_pagedir(void* src_pagedir);
 void vmm_destroy_pagedir(void* pagedir);
 
 /* Map a page */

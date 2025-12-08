@@ -40,4 +40,13 @@ int lfsx_transaction_commit(void* transaction);
 /* Abort transaction */
 void lfsx_transaction_abort(void* transaction);
 
+/* Create file */
+int lfsx_create(const char* path, uint32_t mode);
+
+/* Unlink file */
+int lfsx_unlink(const char* path);
+
+/* Make directory */
+int lfsx_mkdir(const char* path);
+
 #endif /* LFSX_H */

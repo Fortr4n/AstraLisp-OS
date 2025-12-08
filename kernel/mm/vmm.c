@@ -255,6 +255,75 @@ static void free_table_recursive(pt_entry_t* table, int level) {
     pmm_free((void*)table); 
 }
 
+/* Helper: Clone table recursively (Deep Copy for User, Share for Kernel) */
+static int clone_table_recursive(pt_entry_t* src_table, pt_entry_t* dst_table, int level) {
+    for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
+        if (!(src_table[i] & PTE_PRESENT)) {
+            continue;
+        }
+        
+        /* If not User/RW, assume Kernel/Shared -> Shared Mapping */
+        /* Check flags: PTE_USER (bit 2) */
+        if (!(src_table[i] & PTE_USER)) {
+            dst_table[i] = src_table[i];
+            continue;
+        }
+        
+        /* It is a USER Present page/table. We must Deep Copy it. */
+        uintptr_t src_phys = pte_get_phys(src_table[i]);
+        uint64_t flags = src_table[i] & ~PTE_ADDR_MASK;
+        
+        if (level > 1) {
+            /* Intermediate Table */
+            void* new_table_phys = pmm_alloc();
+            if (!new_table_phys) return -1;
+            
+            pt_entry_t* new_table_virt = (pt_entry_t*)P2V((uintptr_t)new_table_phys);
+            memset(new_table_virt, 0, PAGE_SIZE);
+            
+            /* Recurse */
+            if (clone_table_recursive((pt_entry_t*)P2V(src_phys), new_table_virt, level - 1) != 0) {
+                /* Cleanup handled by caller destroying pagedir on failure */
+                 return -1;
+            }
+            
+            dst_table[i] = (uintptr_t)new_table_phys | flags;
+        } else {
+            /* Leaf Page (Level 1) */
+            void* new_page_phys = pmm_alloc();
+            if (!new_page_phys) return -1;
+            
+            /* Copy content */
+            memcpy(P2V((uintptr_t)new_page_phys), P2V(src_phys), PAGE_SIZE);
+            
+            dst_table[i] = (uintptr_t)new_page_phys | flags;
+        }
+    }
+    return 0;
+}
+
+/* Clone address space (Deep Copy) */
+void* vmm_clone_pagedir(void* src_pagedir) {
+    if (!src_pagedir) return NULL;
+    
+    void* new_phys_pml4 = pmm_alloc();
+    if (!new_phys_pml4) return NULL;
+    
+    pt_entry_t* new_pml4 = (pt_entry_t*)P2V((uintptr_t)new_phys_pml4);
+    pt_entry_t* src_pml4 = (pt_entry_t*)src_pagedir;
+    
+    memset(new_pml4, 0, PAGE_SIZE);
+    
+    /* Clone recursively */
+    /* Start at Level 4 */
+    if (clone_table_recursive(src_pml4, new_pml4, 4) != 0) {
+        vmm_destroy_pagedir(new_pml4); /* Clean up partial */
+        return NULL;
+    }
+    
+    return new_pml4;
+}
+
 /* Destroy address space */
 void vmm_destroy_pagedir(void* pagedir) {
     if (!pagedir || pagedir == kernel_pml4) return;

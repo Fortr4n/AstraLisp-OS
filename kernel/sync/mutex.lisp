@@ -214,63 +214,56 @@
   (declare (type spinlock lock))
   (atomic-store (spinlock-locked lock) 0))
 
-;; Atomic operations (FFI to assembly)
+;; Atomic operations (FFI to C)
 (defun compare-and-swap (location old-value new-value)
   "Atomic compare-and-swap operation."
-  (declare (ignore location old-value new-value))
-  ;; This must be implemented in assembly using PowerISA lwarx/stwcx
-  (ffi-compare-and-swap location old-value new-value))
+  (let ((result (alien-funcall (extern-alien "kernel_atomic_compare_and_swap" 
+                               (function (* void) (* void) (* void) (* void)))
+                               location (int-to-lisp old-value) (int-to-lisp new-value))))
+    (not (null result))))
 
 (defun atomic-store (location value)
   "Atomic store operation."
-  (declare (ignore location value))
-  (ffi-atomic-store location value))
+  (alien-funcall (extern-alien "kernel_atomic_store" 
+                 (function (* void) (* void) (* void)))
+                 location (int-to-lisp value)))
 
 ;; Forward declarations
 (defun current-thread ()
   "Get current thread."
-  nil)
+  (alien-funcall (extern-alien "kernel_get_current_thread_ptr" (function (* void)))))
 
 (defun thread-block (thread)
   "Block thread."
-  (declare (ignore thread))
-  nil)
+  (alien-funcall (extern-alien "kernel_thread_block" (function (* void) (* void))) thread))
 
 (defun thread-wake (thread)
   "Wake thread."
-  (declare (ignore thread))
-  nil)
+  (alien-funcall (extern-alien "kernel_thread_wake" (function (* void) (* void))) thread))
 
 (defun thread-priority (thread)
   "Get thread priority."
-  (declare (ignore thread))
-  15)
+  (lisp-to-int (alien-funcall (extern-alien "kernel_thread_get_priority" (function (* void) (* void))) thread)))
 
 (defun thread-set-priority (thread priority)
   "Set thread priority."
-  (declare (ignore thread priority))
-  nil)
+  (alien-funcall (extern-alien "kernel_thread_set_priority" (function (* void) (* void) (* void))) 
+                 thread (int-to-lisp priority)))
 
 (defun get-tick-count ()
   "Get system tick count."
-  0)
+  (lisp-to-int (alien-funcall (extern-alien "get_tick_count" (function (* void))))))
 
 (defun cpu-pause ()
   "Pause CPU for spinlock."
-  nil)
+  (alien-funcall (extern-alien "kernel_cpu_pause" (function (* void)))))
 
 (defun allocate-struct ()
-  "Allocate structure."
-  (make-hash-table))
+  "Allocate structure (memory managed)."
+  (let ((ptr (alien-funcall (extern-alien "kmalloc" (function (* void) unsigned-long)) 64))) ; 64 bytes enough for mutex
+    ptr))
 
-;; FFI declarations
-(defun ffi-compare-and-swap (location old-val new-val)
-  "FFI: Atomic compare-and-swap."
-  (declare (ignore location old-val new-val))
-  nil)
-
-(defun ffi-atomic-store (location value)
-  "FFI: Atomic store."
-  (declare (ignore location value))
-  nil)
+;; Helper to box int/lisp conversion if needed by raw FFI
+(defun lisp-to-int (obj) obj) ;; Placeholder if direct mapping
+(defun int-to-lisp (val) val) ;; Placeholder if direct mapping
 

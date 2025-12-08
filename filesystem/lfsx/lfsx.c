@@ -527,13 +527,17 @@ struct lfsx_file* lfsx_open(const char* path, uint32_t flags) {
     /* Resolve path */
     uint32_t inode_number = lfsx_resolve_path(path);
     if (inode_number == 0) {
-        if (flags & O_CREAT) {
-            /* Implement file creation logic here (simplified for this snippet) */
-            /* Would involve finding parent dir, alloc inode, add dirent. */
-            /* Phase 12 focuses on existing path walking and large files. */
-            return NULL; 
+        if (flags & 0100) { /* O_CREAT (checking raw bit because O_CREAT not def here or use <fcntl.h> if avail) */
+            /* Try to create it */
+            /* Mode 0644 default? */
+            if (lfsx_create(path, 0644) == 0) {
+                inode_number = lfsx_resolve_path(path); /* Resolve again */
+            } else {
+                return NULL;
+            }
+        } else {
+            return NULL;
         }
-        return NULL;
     }
     
     struct lfsx_file* file = (struct lfsx_file*)kmalloc(sizeof(struct lfsx_file));
@@ -549,6 +553,10 @@ struct lfsx_file* lfsx_open(const char* path, uint32_t flags) {
     if (lfsx_read_inode(mounted_fs, inode_number, &file->inode) != 0) {
         kfree(file);
         return NULL;
+    }
+    
+    if (flags & 02000) { /* O_TRUNC? or O_APPEND? Let's say O_TRUNC=01000 */
+        /* Not implementing O_TRUNC yet for brevity, but lfsx_create starts size 0 */
     }
     
     return file;
@@ -666,6 +674,194 @@ void lfsx_close(struct lfsx_file* file) {
         }
         kfree(file);
     }
+}
+
+/* Helper: Split path into parent and filename */
+/* Returns parent path in parent_buf, filename in filename_buf */
+static void lfsx_split_path(const char* path, char* parent_buf, char* filename_buf) {
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        strcpy(parent_buf, "/"); /* Default to root if no slash? Or relative? Assuming absolute */
+        strcpy(filename_buf, path);
+        return;
+    }
+    
+    if (last_slash == path) {
+        strcpy(parent_buf, "/");
+        strcpy(filename_buf, last_slash + 1);
+        return;
+    }
+    
+    size_t parent_len = last_slash - path;
+    strncpy(parent_buf, path, parent_len);
+    parent_buf[parent_len] = '\0';
+    strcpy(filename_buf, last_slash + 1);
+}
+
+/* Helper: Add directory entry */
+static int lfsx_add_dirent(struct lfsx_inode* dir_inode, const char* name, uint32_t inode_num, uint8_t type) {
+    struct lfsx_file dir_file = { .fs = mounted_fs, .inode = *dir_inode, .dirty = false };
+    struct lfsx_dirent entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.inode_number = inode_num;
+    entry.file_type = type;
+    entry.name_length = strlen(name);
+    strncpy(entry.name, name, LFSX_MAX_FILENAME);
+    
+    /* Append to directory file */
+    /* Real implementation should scan for free slots (inode=0) to reuse space */
+    /* For now, simplified append */
+    dir_file.offset = dir_inode->size;
+    
+    /* Ensure we align to block boundaries correctly if needed, or packed? */
+    /* Previous lfsx_resolve_path assumed packed contiguous entries? */
+    /* "struct lfsx_dirent is ~262 bytes". */
+    /* Let's pack them. */
+    
+    lfsx_write(&dir_file, &entry, sizeof(entry));
+    *dir_inode = dir_file.inode; /* Update size/blocks */
+    lfsx_write_inode(mounted_fs, dir_inode);
+    return 0;
+}
+
+/* Helper: Remove directory entry */
+static int lfsx_remove_dirent(struct lfsx_inode* dir_inode, const char* name) {
+    struct lfsx_file dir_file = { .fs = mounted_fs, .inode = *dir_inode };
+    uint8_t buf[LFSX_BLOCK_SIZE];
+    uint64_t offset = 0;
+    
+    while (offset < dir_inode->size) {
+        size_t read = lfsx_read(&dir_file, buf, sizeof(struct lfsx_dirent));
+        if (read < sizeof(struct lfsx_dirent)) break;
+        
+        struct lfsx_dirent* de = (struct lfsx_dirent*)buf;
+        if (de->inode_number != 0 && strncmp(de->name, name, LFSX_MAX_FILENAME) == 0) {
+            /* Found it. Mark as free (inode = 0) */
+            de->inode_number = 0;
+            
+            /* Seek back and write */
+            dir_file.offset = offset;
+            lfsx_write(&dir_file, de, sizeof(struct lfsx_dirent));
+            
+            /* Update parent inode? Size doesn't change, just content. */
+            return 0;
+        }
+        offset += sizeof(struct lfsx_dirent);
+    }
+    return -1;
+}
+
+/* Create file */
+int lfsx_create(const char* path, uint32_t mode) {
+    if (!path || !mounted_fs) return -1;
+    
+    char parent_path[LFSX_MAX_FILENAME];
+    char filename[LFSX_MAX_FILENAME];
+    lfsx_split_path(path, parent_path, filename);
+    
+    uint32_t parent_inode_num = lfsx_resolve_path(parent_path);
+    if (parent_inode_num == 0) return -1; /* Parent not found */
+    
+    /* Check if exists */
+    if (lfsx_resolve_path(path) != 0) return -1; /* Exists */
+    
+    /* Allocate Inode */
+    if (mounted_fs->superblock.free_inodes == 0) return -1;
+    uint32_t new_inode_num = lfsx_alloc_inode(mounted_fs);
+    
+    struct lfsx_inode new_inode;
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.inode_number = new_inode_num;
+    new_inode.mode = mode | 0100000; /* Regular file context */
+    new_inode.link_count = 1;
+    new_inode.size = 0;
+    /* Timestamps would go here */
+    
+    lfsx_write_inode(mounted_fs, &new_inode);
+    
+    /* Add to parent directory */
+    struct lfsx_inode parent_inode;
+    lfsx_read_inode(mounted_fs, parent_inode_num, &parent_inode);
+    lfsx_add_dirent(&parent_inode, filename, new_inode_num, 1); /* 1=File */
+    
+    return 0;
+}
+
+/* Unlink file */
+int lfsx_unlink(const char* path) {
+    if (!path || !mounted_fs) return -1;
+    
+    uint32_t inode_num = lfsx_resolve_path(path);
+    if (inode_num == 0) return -1;
+    
+    char parent_path[LFSX_MAX_FILENAME];
+    char filename[LFSX_MAX_FILENAME];
+    lfsx_split_path(path, parent_path, filename);
+    
+    uint32_t parent_inode_num = lfsx_resolve_path(parent_path);
+    if (parent_inode_num == 0) return -1;
+    
+    struct lfsx_inode parent_inode;
+    lfsx_read_inode(mounted_fs, parent_inode_num, &parent_inode);
+    
+    if (lfsx_remove_dirent(&parent_inode, filename) != 0) return -1;
+    
+    /* Decrement link count */
+    struct lfsx_inode inode;
+    lfsx_read_inode(mounted_fs, inode_num, &inode);
+    if (inode.link_count > 0) inode.link_count--;
+    
+    if (inode.link_count == 0) {
+        /* Free blocks (simplified, really need free_blocks_recursive) */
+        /* lfsx_free_inode(mounted_fs, inode_num); */
+        /* Mark inode as 0 mode/size to indicate free? Or use bitmap/freelist? */
+        /* For this phase, we update inode. */
+        inode.mode = 0;
+    }
+    lfsx_write_inode(mounted_fs, &inode);
+    
+    return 0;
+}
+
+/* Make directory */
+int lfsx_mkdir(const char* path) {
+    if (!path || !mounted_fs) return -1;
+    
+    /* Check parent exists */
+    char parent_path[LFSX_MAX_FILENAME];
+    char dirname[LFSX_MAX_FILENAME];
+    lfsx_split_path(path, parent_path, dirname);
+    
+    uint32_t parent_inode_num = lfsx_resolve_path(parent_path);
+    if (parent_inode_num == 0) return -1;
+    
+    if (lfsx_resolve_path(path) != 0) return -1; /* Exists */
+    
+    /* Allocate Inode */
+    uint32_t new_inode_num = lfsx_alloc_inode(mounted_fs);
+    
+    struct lfsx_inode new_inode;
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.inode_number = new_inode_num;
+    new_inode.mode = 0040755; /* Directory */
+    new_inode.link_count = 2; /* . and parent link */
+    new_inode.size = 0;
+    
+    /* Create dot and dotdot entries */
+    /* We need to temporarily write these to the new dir */
+    /* lfsx_add_dirent writes to a "dir_inode". */
+    /* We need to write the new inode first so add_dirent can read/update it? */
+    lfsx_write_inode(mounted_fs, &new_inode);
+    
+    lfsx_add_dirent(&new_inode, ".", new_inode_num, 2); /* 2=Dir */
+    lfsx_add_dirent(&new_inode, "..", parent_inode_num, 2);
+    
+    /* Add to parent */
+    struct lfsx_inode parent_inode;
+    lfsx_read_inode(mounted_fs, parent_inode_num, &parent_inode);
+    lfsx_add_dirent(&parent_inode, dirname, new_inode_num, 2);
+    
+    return 0;
 }
 
 /* Create transaction */

@@ -854,31 +854,81 @@
 
 ;;; Forward Declarations
 
-(defun get-current-pid () 1)
-(defun get-parent-pid () 0)
-(defun get-tick-count () 0)
-(defun get-system-time () 0)
-(defun get-system-time-usec () (cons 0 0))
-(defun get-clock-time (clk-id) (declare (ignore clk-id)) (cons 0 0))
+;;; Forward Declarations - Implementation via Alien FFI
 
-(defun process-exit (status) (declare (ignore status)) nil)
-(defun process-fork () 1)
-(defun process-exec (filename argv envp) (declare (ignore filename argv envp)) 0)
-(defun process-wait (pid status options) (declare (ignore pid status options)) 0)
-(defun process-brk (addr) (declare (ignore addr)) 0)
+(defun get-current-pid () 
+  (alien-funcall (extern-alien "get_current_pid" (function unsigned-int))))
+
+(defun get-parent-pid () 
+  (alien-funcall (extern-alien "get_parent_pid" (function unsigned-int))))
+
+(defun get-tick-count () 
+   (alien-funcall (extern-alien "timer_get_tick" (function unsigned-long))))
+
+(defun get-system-time () 
+   (alien-funcall (extern-alien "timer_get_unix_time" (function unsigned-long))))
+
+(defun get-system-time-usec () 
+   (let ((sec (alien-funcall (extern-alien "timer_get_unix_time" (function unsigned-long))))
+         (usec (alien-funcall (extern-alien "timer_get_usec" (function unsigned-long)))))
+     (cons sec usec)))
+
+(defun get-clock-time (clk-id) 
+  (declare (ignore clk-id)) 
+  (get-system-time-usec))
+
+(defun process-exit (status)
+  (alien-funcall (extern-alien "process_exit" (function void int)) status))
+
+(defun process-fork ()
+  (alien-funcall (extern-alien "process_fork" (function int))))
+
+(defun process-exec (filename argv envp) 
+   (alien-funcall (extern-alien "process_exec" (function int c-string (* c-string) (* c-string)))
+                  filename argv envp))
+
+(defun process-wait (pid status options) 
+   (alien-funcall (extern-alien "process_wait" (function int int (* int) int))
+                  pid status options))
+
+(defun process-brk (addr) 
+   (alien-funcall (extern-alien "process_brk" (function int unsigned-long)) addr))
+
 (defun process-mmap (addr length prot flags fd offset)
-  (declare (ignore addr length prot flags fd offset)) 0)
-(defun process-munmap (addr length) (declare (ignore addr length)) 0)
-(defun process-mprotect (addr length prot) (declare (ignore addr length prot)) 0)
-(defun process-sleep (nsec) (declare (ignore nsec)) nil)
+   (alien-funcall (extern-alien "process_mmap" (function unsigned-long unsigned-long unsigned-long int int int unsigned-long))
+                  addr length prot flags fd offset))
 
-(defun vfs-open (pathname flags mode) (declare (ignore pathname flags mode)) 0)
-(defun vfs-close (fd) (declare (ignore fd)) 0)
-(defun vfs-read (fd buf count) (declare (ignore fd buf count)) 0)
-(defun vfs-write (fd buf count) (declare (ignore fd buf count)) 0)
-(defun vfs-lseek (fd offset whence) (declare (ignore fd offset whence)) 0)
+(defun process-munmap (addr length)
+   (alien-funcall (extern-alien "process_munmap" (function int unsigned-long unsigned-long))
+                  addr length))
 
-(defun signal-send (pid sig) (declare (ignore pid sig)) 0)
+(defun process-mprotect (addr length prot)
+   (alien-funcall (extern-alien "process_mprotect" (function int unsigned-long unsigned-long int))
+                  addr length prot))
 
-(defun scheduler-yield () nil)
+(defun process-sleep (nsec)
+   ;; Convert nsec to ticks (assuming 1ms tick = 1000000ns)
+   (let ((ticks (floor nsec 1000000)))
+     (alien-funcall (extern-alien "scheduler_sleep" (function void unsigned-int)) ticks)))
+
+(defun vfs-open (pathname flags mode) 
+  (alien-funcall (extern-alien "lfsx_vfs_open" (function int c-string int int)) pathname flags mode))
+
+(defun vfs-close (fd) 
+  (alien-funcall (extern-alien "lfsx_vfs_close" (function int int)) fd))
+
+(defun vfs-read (fd buf count) 
+  (alien-funcall (extern-alien "lfsx_vfs_read" (function int int (* void) unsigned-long)) fd buf count))
+
+(defun vfs-write (fd buf count) 
+  (alien-funcall (extern-alien "lfsx_vfs_write" (function int int (* void) unsigned-long)) fd buf count))
+
+(defun vfs-lseek (fd offset whence) 
+  (alien-funcall (extern-alien "lfsx_vfs_lseek" (function int int long int)) fd offset whence))
+
+(defun signal-send (pid sig) 
+  (alien-funcall (extern-alien "signal_send" (function int int int)) pid sig))
+
+(defun scheduler-yield () 
+  (alien-funcall (extern-alien "scheduler_yield" (function void))))
 

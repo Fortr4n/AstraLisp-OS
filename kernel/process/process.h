@@ -48,6 +48,7 @@ struct thread {
     uint64_t sleep_until;
     uint64_t time_slice;
     uint64_t cpu_time_ns;  /* CPU time consumed */
+    void* user_data;       /* generic user data (e.g. for trampolines) */
     struct thread* next;
     struct thread* prev;
 };
@@ -55,11 +56,15 @@ struct thread {
 /* Global process list (for Lisp introspection) */
 extern struct process* process_list;
 extern struct process* current_process;
+extern struct thread* current_thread;
 extern uint32_t next_pid;
 extern uint32_t next_tid;
 
 /* Create process */
 struct process* process_create(void);
+
+/* Fork process */
+struct process* process_fork(struct process* parent);
 
 /* Destroy process */
 void process_destroy(struct process* proc);
@@ -69,6 +74,9 @@ struct thread* thread_create(struct process* proc, void (*entry)(void));
 
 /* Destroy thread */
 void thread_destroy(struct thread* thread);
+
+/* Exit thread */
+void thread_exit(void);
 
 /* Get current process */
 struct process* process_get_current(void);

@@ -2,7 +2,7 @@
 ;; Production capability-based security system with delegation and revocation
 
 (defpackage :astralisp-capabilities
-  (:use :cl)
+  (:use :cl :astralisp-mutex)
   (:export :cap-init
            :cap-create
            :cap-derive
@@ -725,14 +725,6 @@
 (defun get-tick-count ()
   "Get system tick count (forward declaration)."
   0)
-
-(defun make-mutex ()
-  "Create mutex (forward declaration)."
-  nil)
-
-(defmacro with-mutex ((mutex) &body body)
-  "Execute body with mutex held (forward declaration)."
-  `(progn ,@body))
 
 (defun atomic-incf (place)
   "Atomic increment (forward declaration)."

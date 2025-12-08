@@ -2,7 +2,7 @@
 ;; Production RPC implementation with comprehensive marshalling
 
 (defpackage :astralisp-rpc
-  (:use :cl)
+  (:use :cl :astralisp-mutex :astralisp-semaphore)
   (:export :rpc-init
            :rpc-call
            :rpc-call-async

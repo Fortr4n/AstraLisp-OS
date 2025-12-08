@@ -638,13 +638,17 @@
 
 (defun get-current-time ()
   "Get current time."
-  0)
+  (alien-funcall (extern-alien "timer_get_unix_time" (function unsigned-long))))
 
 (defun make-mutex ()
   "Create mutex."
-  (make-hash-table))
+  (alien-funcall (extern-alien "mutex_create" (function (* void)))))
 
 (defmacro with-mutex ((mutex) &body body)
   "Execute body with mutex held."
-  (declare (ignore mutex))
-  `(progn ,@body))
+  (let ((m (gensym)))
+    `(let ((,m ,mutex))
+       (alien-funcall (extern-alien "mutex_lock" (function void (* void))) ,m)
+       (unwind-protect
+            (progn ,@body)
+         (alien-funcall (extern-alien "mutex_unlock" (function void (* void))) ,m)))))
