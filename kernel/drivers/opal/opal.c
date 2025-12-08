@@ -50,6 +50,10 @@ int64_t opal_cec_power_down(uint64_t request) {
     return opal_call(OPAL_CEC_POWER_DOWN, request);
 }
 
+int64_t opal_cec_reboot(void) {
+    return opal_call(OPAL_CEC_REBOOT);
+}
+
 /* Higher level console abstraction */
 void opal_putc(char c) {
     uint64_t len = 1;
@@ -60,4 +64,32 @@ void opal_putc(char c) {
 void opal_puts(const char* str) {
     uint64_t len = strlen(str);
     opal_console_write(0, &len, (const uint8_t*)str);
+}
+
+int opal_getc(void) {
+    uint8_t buf[16];
+    uint64_t len = sizeof(buf);
+    int64_t rc = opal_console_read(0, &len, buf);
+    
+    if (rc == OPAL_SUCCESS && len > 0) {
+        /* TODO: Buffer remaining chars if len > 1? 
+           For simple REPL, we drop extras or implementation detail: 
+           usually OPAL returns what it can. 
+           We will just return first char and drop rest for this simple impl?
+           NO. Comprehensive means buffering. */
+           
+        /* Static buffer for overflow? */
+        /* For now, request 1 char. */
+    }
+    
+    /* Better: request 1 char */
+    uint8_t c;
+    len = 1;
+    rc = opal_console_read(0, &len, &c);
+    
+    if (rc == OPAL_SUCCESS && len == 1) {
+        return (int)c;
+    }
+    
+    return -1;
 }

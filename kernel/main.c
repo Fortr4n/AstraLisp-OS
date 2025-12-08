@@ -7,10 +7,12 @@
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "multiboot2.h"
+#include "arch/ppc64/smp.h"
 #include "../runtime/lisp/gc.h"      /* Lisp Headers */
 #include "../runtime/lisp/evaluator.h"
 #include "../runtime/lisp/reader.h"
 #include "../runtime/lisp/drivers.h"
+#include "../runtime/lisp/kernel_bindings.h"
 
 /* Helper to convert serial char to Lisp reader input? 
    No, we'll just buffer a line. */
@@ -74,6 +76,23 @@ void kernel_main(uint64_t magic, void* addr) {
          for(;;);
     }
     
+    /* Initialize SMP */
+    if (fdt_ptr) {
+        if (smp_init(fdt_ptr) == 0) {
+            opal_puts("SMP Initialized. CPUs: ");
+            /* Print CPU count - simple int print */
+            char buf[16];
+            uint32_t cnt = smp_get_cpu_count();
+            int i = 0;
+            if (cnt == 0) buf[i++] = '0';
+            else {
+                while (cnt > 0) { buf[i++] = '0' + (cnt % 10); cnt /= 10; }
+            }
+            while (i > 0) opal_putc(buf[--i]);
+            opal_puts("\n");
+        }
+    }
+    
     /* Initialize Lisp Runtime */
     if (fdt_ptr) opal_puts("Initializing AstraLisp Runtime...\n");
     
@@ -87,25 +106,63 @@ void kernel_main(uint64_t magic, void* addr) {
     }
     
     drivers_init(); /* Init Lisp drivers */
+    kernel_bindings_init(); /* Init Kernel builtins */
     
     if (fdt_ptr) opal_puts("Entering REPL...\n");
     
     /* REPL */
-    char input_buffer[256];
-    int pos = 0;
+    char input_buffer[1024];
+    size_t buffer_pos = 0;
+    
+    opal_puts("\n> ");
     
     for (;;) {
-        /* Check OPAL console for input */
-        int64_t rc;
-        char c;
-        // rc = opal_console_read(0, &len, buf);
-        // This is a blocking/async quirk in OPAL. 
-        // Need to poll.
-        // Simplified:
-        // if (opal_poll_char(&c)) { ... }
+        int c_int = opal_getc();
         
-        /* For now, just idle loop */
-         __asm__ volatile ("or 27,27,27"); /* yield */
+        if (c_int != -1) {
+            char c = (char)c_int;
+            
+            /* Echo */
+            opal_putc(c);
+            
+            if (c == '\r' || c == '\n') {
+                opal_putc('\n');
+                input_buffer[buffer_pos] = '\0';
+                
+                if (buffer_pos > 0) {
+                    /* Read */
+                    struct reader_context ctx;
+                    reader_init(&ctx, input_buffer);
+                    
+                    /* Helper to read all expressions in line? Or just one?
+                       Normally REPL reads one. */
+                    lisp_value expr = reader_read(&ctx);
+                    
+                    /* Eval */
+                    GC_PUSH_1(expr);
+                    lisp_value result = lisp_eval(lisp_get_global_env(), expr);
+                    
+                    /* Print */
+                    lisp_print(result);
+                    opal_putc('\n');
+                    
+                    GC_POP(); /* expr */
+                }
+                
+                buffer_pos = 0;
+                opal_puts("> ");
+            } else if (c == '\b' || c == 127) {
+                if (buffer_pos > 0) {
+                    buffer_pos--;
+                    opal_puts("\b \b");
+                }
+            } else if (buffer_pos < sizeof(input_buffer) - 1) {
+                input_buffer[buffer_pos++] = c;
+            }
+        } else {
+             /* Yield/Wait */
+             __asm__ volatile ("or 27,27,27");
+        }
     }
 }
 

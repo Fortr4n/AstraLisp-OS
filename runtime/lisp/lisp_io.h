@@ -2,10 +2,10 @@
 #define LISP_IO_H
 
 #ifdef KERNEL
-    #include "../../kernel/hal/serial.h"
-    #define LISP_PRINTF(fmt, ...) /* No printf in kernel yet, use serial_puts for simple strings */
-    #define LISP_PUTS(s) serial_puts(s)
-    #define LISP_PUTCHAR(c) serial_putchar(c)
+    #include "../../kernel/drivers/opal/opal.h"
+    #define LISP_PRINTF(fmt, ...) opal_puts(fmt) /* Warning: No formatting yet */
+    #define LISP_PUTS(s) opal_puts(s)
+    #define LISP_PUTCHAR(c) opal_putc(c)
 #else
     #include <stdio.h>
     #define LISP_PRINTF(fmt, ...) printf(fmt, ##__VA_ARGS__)

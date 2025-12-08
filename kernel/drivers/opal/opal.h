@@ -14,6 +14,10 @@
 #define OPAL_CEC_POWER_DOWN         5
 #define OPAL_CEC_REBOOT             6
 #define OPAL_POLL_EVENTS            10
+#define OPAL_START_CPU              41
+#define OPAL_QUERY_CPU_STATUS       42
+#define OPAL_RETURN_CPU             69
+#define OPAL_REINIT_CPUS            70
 
 #define OPAL_CONFIG_CPU_IDLE_STATE  115
 #define OPAL_SLW_SET_REG            116
@@ -40,6 +44,10 @@
 #define OPAL_XIVE_GET_PHB_IRQ_SPACE 143
 #define OPAL_XIVE_REGISTER_PHB      144
 #define OPAL_XIVE_SYNC              145
+
+void opal_putc(char c);
+void opal_puts(const char* str);
+int opal_getc(void); /* Returns -1 if no input, char cast to int otherwise */
 
 /* Return Codes */
 #define OPAL_SUCCESS                0
