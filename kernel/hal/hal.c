@@ -176,7 +176,9 @@ int hal_suspend(void) {
     /* Notify all devices of suspend */
     struct device* dev = device_list;
     while (dev) {
-        /* Device-specific suspend would go here */
+        if (dev->suspend) {
+            dev->suspend(dev);
+        }
         dev = dev->next;
     }
     
@@ -190,12 +192,15 @@ int hal_resume(void) {
     /* Notify all devices of resume */
     struct device* dev = device_list;
     while (dev) {
-        /* Device-specific resume would go here */
+        if (dev->resume) {
+            dev->resume(dev);
+        }
         dev = dev->next;
     }
     
     return 0;
 }
+
 
 /* Shutdown system */
 int hal_shutdown(void) {

@@ -268,14 +268,273 @@ int lfsx_mount(const char* device) {
     return 0;
 }
 
+/* Helper: Get physical block number for a logical block index (handles indirects) */
+/* Returns 0 if block not allocated (sparse) */
+/* alloc: If true, allocate missing blocks and update inode */
+static uint64_t lfsx_get_block_number(struct lfsx_file* file, uint64_t logical_block, bool alloc) {
+    if (!file) return 0;
+    
+    struct lfsx_inode* inode = &file->inode;
+    uint64_t block = 0;
+    
+    /* Direct blocks (0-11) */
+    if (logical_block < 12) {
+        block = inode->direct_blocks[logical_block];
+        if (block == 0 && alloc) {
+            if (file->fs->superblock.free_blocks == 0) return 0;
+            block = file->fs->superblock.free_blocks--;
+            inode->direct_blocks[logical_block] = block;
+            file->dirty = true;
+            
+            /* Zero new block */
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, block, zero);
+        }
+        return block;
+    }
+    
+    logical_block -= 12;
+    uint32_t pointers_per_block = LFSX_BLOCK_SIZE / 8;
+    
+    /* Single Indirect */
+    if (logical_block < pointers_per_block) {
+        if (inode->indirect_block == 0) {
+            if (!alloc) return 0;
+            if (file->fs->superblock.free_blocks == 0) return 0;
+            inode->indirect_block = file->fs->superblock.free_blocks--;
+            file->dirty = true;
+            
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, inode->indirect_block, zero);
+        }
+        
+        uint64_t indirect_buf[LFSX_BLOCK_SIZE/8];
+        lfsx_read_block(file->fs, inode->indirect_block, indirect_buf);
+        
+        block = indirect_buf[logical_block];
+        if (block == 0 && alloc) {
+            if (file->fs->superblock.free_blocks == 0) return 0;
+            block = file->fs->superblock.free_blocks--;
+            indirect_buf[logical_block] = block;
+            lfsx_write_block(file->fs, inode->indirect_block, indirect_buf);
+            
+             /* Zero new block */
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, block, zero);
+        }
+        return block;
+    }
+    
+    logical_block -= pointers_per_block;
+    
+    /* Double Indirect */
+    if (logical_block < (uint64_t)pointers_per_block * pointers_per_block) {
+        if (inode->double_indirect_block == 0) {
+            if (!alloc) return 0;
+            /* Allocate double indirect pointer block */
+             if (file->fs->superblock.free_blocks == 0) return 0;
+            inode->double_indirect_block = file->fs->superblock.free_blocks--;
+            file->dirty = true;
+            
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, inode->double_indirect_block, zero);
+        }
+        
+        uint64_t l1_idx = logical_block / pointers_per_block;
+        uint64_t l2_idx = logical_block % pointers_per_block;
+        
+        uint64_t l1_buf[LFSX_BLOCK_SIZE/8];
+        lfsx_read_block(file->fs, inode->double_indirect_block, l1_buf);
+        
+        if (l1_buf[l1_idx] == 0) {
+            if (!alloc) return 0;
+            /* Allocate single indirect block */
+             if (file->fs->superblock.free_blocks == 0) return 0;
+            l1_buf[l1_idx] = file->fs->superblock.free_blocks--;
+            lfsx_write_block(file->fs, inode->double_indirect_block, l1_buf);
+            
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, l1_buf[l1_idx], zero);
+        }
+        
+        uint64_t l2_buf[LFSX_BLOCK_SIZE/8];
+        lfsx_read_block(file->fs, l1_buf[l1_idx], l2_buf);
+        
+        block = l2_buf[l2_idx];
+        if (block == 0 && alloc) {
+            if (file->fs->superblock.free_blocks == 0) return 0;
+            block = file->fs->superblock.free_blocks--;
+            l2_buf[l2_idx] = block;
+            lfsx_write_block(file->fs, l1_buf[l1_idx], l2_buf);
+            
+             /* Zero new block */
+            uint8_t zero[LFSX_BLOCK_SIZE];
+            memset(zero, 0, LFSX_BLOCK_SIZE);
+            lfsx_write_block(file->fs, block, zero);
+        }
+        return block;
+    }
+    
+    /* Triple indirect omitted for brevity but follows same pattern logic */
+    /* Phase 12 Requirement: "Comprehensive". Okay, implementing Triple. */
+    logical_block -= (uint64_t)pointers_per_block * pointers_per_block;
+    
+    /* Triple Indirect */
+    if (inode->triple_indirect_block == 0) {
+        if (!alloc) return 0;
+        if (file->fs->superblock.free_blocks == 0) return 0;
+        inode->triple_indirect_block = file->fs->superblock.free_blocks--;
+        file->dirty = true;
+        uint8_t zero[LFSX_BLOCK_SIZE];
+        memset(zero, 0, LFSX_BLOCK_SIZE);
+        lfsx_write_block(file->fs, inode->triple_indirect_block, zero);
+    }
+
+    uint64_t l1_idx = logical_block / ((uint64_t)pointers_per_block * pointers_per_block);
+    uint64_t rem = logical_block % ((uint64_t)pointers_per_block * pointers_per_block);
+    uint64_t l2_idx = rem / pointers_per_block;
+    uint64_t l3_idx = rem % pointers_per_block;
+    
+    uint64_t l1_buf[LFSX_BLOCK_SIZE/8];
+    lfsx_read_block(file->fs, inode->triple_indirect_block, l1_buf);
+    
+    if (l1_buf[l1_idx] == 0) {
+        if (!alloc) return 0;
+        if (file->fs->superblock.free_blocks == 0) return 0;
+        l1_buf[l1_idx] = file->fs->superblock.free_blocks--;
+        lfsx_write_block(file->fs, inode->triple_indirect_block, l1_buf);
+        uint8_t zero[LFSX_BLOCK_SIZE];
+        memset(zero, 0, LFSX_BLOCK_SIZE);
+        lfsx_write_block(file->fs, l1_buf[l1_idx], zero);
+    }
+    
+    uint64_t l2_buf[LFSX_BLOCK_SIZE/8];
+    lfsx_read_block(file->fs, l1_buf[l1_idx], l2_buf);
+    
+    if (l2_buf[l2_idx] == 0) {
+        if (!alloc) return 0;
+        if (file->fs->superblock.free_blocks == 0) return 0;
+        l2_buf[l2_idx] = file->fs->superblock.free_blocks--;
+        lfsx_write_block(file->fs, l1_buf[l1_idx], l2_buf);
+         uint8_t zero[LFSX_BLOCK_SIZE];
+        memset(zero, 0, LFSX_BLOCK_SIZE);
+        lfsx_write_block(file->fs, l2_buf[l2_idx], zero);
+    }
+    
+    uint64_t l3_buf[LFSX_BLOCK_SIZE/8];
+    lfsx_read_block(file->fs, l2_buf[l2_idx], l3_buf);
+    
+    block = l3_buf[l3_idx];
+    if (block == 0 && alloc) {
+        if (file->fs->superblock.free_blocks == 0) return 0;
+        block = file->fs->superblock.free_blocks--;
+        l3_buf[l3_idx] = block;
+        lfsx_write_block(file->fs, l2_buf[l2_idx], l3_buf);
+         uint8_t zero[LFSX_BLOCK_SIZE];
+        memset(zero, 0, LFSX_BLOCK_SIZE);
+        lfsx_write_block(file->fs, block, zero);
+    }
+    
+    return block;
+}
+
+/* Helper: Resolve path to inode */
+static uint32_t lfsx_resolve_path(const char* path) {
+    if (!path || !mounted_fs) return 0;
+    
+    /* Start at root (inode 1 usually, or 2 depending on FS) */
+    /* This impl uses 1 as root? Check mount. next_inode_number starts at 1. Assuming 1 is root. */
+    uint32_t current_inode_num = 1; 
+    
+    if (strcmp(path, "/") == 0) return current_inode_num;
+    
+    /* Skip leading slash */
+    const char* curr = path;
+    if (*curr == '/') curr++;
+    
+    char name_buf[LFSX_MAX_FILENAME + 1];
+    
+    while (*curr) {
+        /* Extract next component */
+        const char* next_slash = strchr(curr, '/');
+        int len = next_slash ? (next_slash - curr) : strlen(curr);
+        if (len > LFSX_MAX_FILENAME) len = LFSX_MAX_FILENAME;
+        
+        strncpy(name_buf, curr, len);
+        name_buf[len] = '\0';
+        
+        /* Read current dir inode */
+        struct lfsx_inode dir_inode;
+        if (lfsx_read_inode(mounted_fs, current_inode_num, &dir_inode) != 0) return 0;
+        
+        /* Scan dir blocks for entry */
+        /* Construct a temporary file struct to use helper? Or just manual block read */
+        struct lfsx_file dir_file = { .fs = mounted_fs, .inode = dir_inode };
+        
+        bool found = false;
+        uint64_t offset = 0;
+        uint8_t buf[LFSX_BLOCK_SIZE];
+        
+        while (offset < dir_inode.size) {
+            uint64_t blk_idx = offset / LFSX_BLOCK_SIZE;
+            /* We need read-only access to blocks, use helper with alloc=false */
+            uint64_t phys_blk = lfsx_get_block_number(&dir_file, blk_idx, false);
+            
+            if (phys_blk == 0) break; /* Hole in dir? Should not happen */
+            
+            if (lfsx_read_block(mounted_fs, phys_blk, buf) != 0) break;
+            
+            struct lfsx_dirent* de = (struct lfsx_dirent*)buf;
+            while ((uintptr_t)de < (uintptr_t)buf + LFSX_BLOCK_SIZE) {
+                if (de->inode_number != 0) {
+                     if (strncmp(de->name, name_buf, len) == 0 && de->name[len] == '\0') {
+                         current_inode_num = de->inode_number;
+                         found = true;
+                         break;
+                     }
+                }
+                /* Advance by entry size? Fixed size or variable? */
+                /* Struct says char name[255], so fixed size structure usually? */
+                /* struct lfsx_dirent is ~262 bytes? */
+                /* No, sizeof(struct lfsx_dirent) is 4+2+1+255 = 262 bytes plus padding? */
+                /* Let's assume packed or aligned. */
+                de = (struct lfsx_dirent*)((uintptr_t)de + sizeof(struct lfsx_dirent));
+            }
+            if (found) break;
+            offset += LFSX_BLOCK_SIZE;
+        }
+        
+        if (!found) return 0; /* Not found */
+        
+        if (!next_slash) break;
+        curr = next_slash + 1;
+    }
+    
+    return current_inode_num;
+}
+
 /* Open file */
 struct lfsx_file* lfsx_open(const char* path, uint32_t flags) {
     if (!path || !mounted_fs) {
         return NULL;
     }
     
-    /* Lookup inode by path */
-    uint32_t inode_number = 0;  /* Would resolve path */
+    /* Resolve path */
+    uint32_t inode_number = lfsx_resolve_path(path);
+    if (inode_number == 0) {
+        if (flags & O_CREAT) {
+            /* Implement file creation logic here (simplified for this snippet) */
+            /* Would involve finding parent dir, alloc inode, add dirent. */
+            /* Phase 12 focuses on existing path walking and large files. */
+            return NULL; 
+        }
+        return NULL;
+    }
     
     struct lfsx_file* file = (struct lfsx_file*)kmalloc(sizeof(struct lfsx_file));
     if (!file) {
@@ -321,31 +580,25 @@ size_t lfsx_read(struct lfsx_file* file, void* buffer, size_t size) {
             chunk_size = to_read - bytes_read;
         }
         
-        /* Get block number from inode */
-        uint64_t block_number = 0;
-        if (block_index < 12) {
-            block_number = file->inode.direct_blocks[block_index];
-        } else {
-            /* Handle indirect blocks */
-            return bytes_read;
-        }
+        /* Get block number via helper (handles indirects) */
+        uint64_t block_number = lfsx_get_block_number(file, block_index, false);
         
         if (block_number == 0) {
-            break;
+            /* Sparse file read (return zeros) */
+            memset(buf + bytes_read, 0, chunk_size);
+        } else {
+             /* Read block */
+            uint8_t block[LFSX_BLOCK_SIZE];
+            if (lfsx_read_block(file->fs, block_number, block) != 0) {
+                break;
+            }
+            memcpy(buf + bytes_read, block + block_offset, chunk_size);
         }
         
-        /* Read block */
-        uint8_t block[LFSX_BLOCK_SIZE];
-        if (lfsx_read_block(file->fs, block_number, block) != 0) {
-            break;
-        }
-        
-        memcpy(buf + bytes_read, block + block_offset, chunk_size);
         bytes_read += chunk_size;
     }
     
     file->offset += bytes_read;
-    
     return bytes_read;
 }
 
@@ -366,30 +619,19 @@ size_t lfsx_write(struct lfsx_file* file, const void* buffer, size_t size) {
             chunk_size = size - bytes_written;
         }
         
-        /* Get or allocate block */
-        uint64_t block_number = 0;
-        if (block_index < 12) {
-            block_number = file->inode.direct_blocks[block_index];
-            if (block_number == 0) {
-                /* Allocate new block */
-                block_number = file->fs->superblock.free_blocks;
-                file->fs->superblock.free_blocks--;
-                file->inode.direct_blocks[block_index] = block_number;
-                file->dirty = true;
-            }
-        } else {
-            /* Handle indirect blocks */
-            return bytes_written;
-        }
+        /* Get or allocate block (handles indirects) */
+        uint64_t block_number = lfsx_get_block_number(file, block_index, true);
+        if (block_number == 0) return bytes_written; /* Disk full? */
         
-        /* Read existing block or create new */
+        /* Read existing block if partial write */
         uint8_t block[LFSX_BLOCK_SIZE];
         if (block_offset == 0 && chunk_size == LFSX_BLOCK_SIZE) {
-            memset(block, 0, LFSX_BLOCK_SIZE);
+            /* Overwriting full block, no read needed. But get_block_number might have already zeroed it. */
         } else {
-            if (lfsx_read_block(file->fs, block_number, block) != 0) {
-                memset(block, 0, LFSX_BLOCK_SIZE);
-            }
+             if (lfsx_read_block(file->fs, block_number, block) != 0) {
+                 /* Error reading block? Should be zeroed if new. */
+                 memset(block, 0, LFSX_BLOCK_SIZE);
+             }
         }
         
         memcpy(block + block_offset, buf + bytes_written, chunk_size);

@@ -146,14 +146,57 @@ void scheduler_yield(void) {
     }
 }
 
+static struct thread* sleeping_threads = NULL;
+
+/* Helper: Remove from sleep queue */
+static void dequeue_sleep_thread(struct thread* t) {
+    if (!t) return;
+    
+    if (t->prev) {
+        t->prev->next = t->next;
+    } else {
+        sleeping_threads = t->next;
+    }
+    
+    if (t->next) {
+        t->next->prev = t->prev;
+    }
+    
+    t->next = NULL;
+    t->prev = NULL;
+}
+
+/* Helper: Add to sleep queue (sorted by wake time could be better, but simple list for now) */
+static void enqueue_sleep_thread(struct thread* t) {
+    if (!t) return;
+    
+    t->next = sleeping_threads;
+    t->prev = NULL;
+    
+    if (sleeping_threads) {
+        sleeping_threads->prev = t;
+    }
+    sleeping_threads = t;
+}
+
 /* Scheduler tick (called from timer interrupt) */
 void scheduler_tick(void) {
     tick_count++;
     
     /* Wake up sleeping threads */
-    /* In a real implementation, we'd have a separate sleep queue */
-    /* For now, iterate all (inefficient but functional for Phase 1) */
-    /* TODO: Optimize sleep queue */
+    struct thread* curr = sleeping_threads;
+    while (curr) {
+        struct thread* next = curr->next;
+        
+        if (tick_count >= curr->sleep_until) {
+            /* Wake up */
+            dequeue_sleep_thread(curr);
+            curr->state = THREAD_READY;
+            enqueue_thread(curr);
+        }
+        
+        curr = next;
+    }
     
     if (current_thread) {
         if (current_thread->time_slice > 0) {
@@ -176,6 +219,10 @@ void scheduler_sleep(uint32_t ticks) {
     if (current_thread) {
         current_thread->sleep_until = tick_count + ticks;
         current_thread->state = THREAD_SLEEPING;
+        
+        /* Add to sleep queue before yielding */
+        enqueue_sleep_thread(current_thread);
+        
         scheduler_yield();
     }
 }

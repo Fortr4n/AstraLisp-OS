@@ -12,6 +12,8 @@ struct device {
     uint32_t type;
     void* base_address;
     uint32_t irq;
+    int (*suspend)(struct device*);
+    int (*resume)(struct device*);
     struct device* next;
 };
 

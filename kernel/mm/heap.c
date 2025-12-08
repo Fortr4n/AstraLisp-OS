@@ -409,8 +409,7 @@ int buddy_init(void* start, size_t size, uint32_t min_order, uint32_t max_order)
 
     /* Add initial block(s) to free lists */
     /* Since size might not be power of 2, we need to add multiple blocks */
-    /* For simplicity in Phase 1, we assume size is large enough and we just add the largest power of 2 block that fits */
-    /* TODO: Handle non-power-of-2 sizes correctly by adding multiple blocks */
+    /* We add the largest power of 2 blocks that fit until memory is covered */
     
     /* Find largest order that fits in remaining size */
     size_t remaining_size = buddy_alloc_state.memory_size;
