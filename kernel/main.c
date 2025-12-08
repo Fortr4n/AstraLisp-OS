@@ -9,6 +9,8 @@
 #include "multiboot2.h"
 #include "arch/ppc64/smp.h"
 #include "process/scheduler.h"
+#include "input/input.h"
+#include "driver/ps2.h"
 #include "../runtime/lisp/gc.h"      /* Lisp Headers */
 #include "../runtime/lisp/evaluator.h"
 #include "../runtime/lisp/reader.h"
@@ -96,6 +98,13 @@ void kernel_main(uint64_t magic, void* addr) {
     
     /* Initialize Scheduler */
     scheduler_init();
+    
+    /* Initialize Input Subsystem */
+    input_init();
+    if (fdt_ptr) {
+        /* Initialize PS/2 (Assume PC-like or check FDT, but for now we force it for testing) */
+        ps2_init();
+    }
     
     /* Initialize Lisp Runtime */
     if (fdt_ptr) opal_puts("Initializing AstraLisp Runtime...\n");

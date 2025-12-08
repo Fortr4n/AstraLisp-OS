@@ -15,6 +15,7 @@
 #include "../../filesystem/lfsx/lfsx.h"
 #include "../driver/storage.h"
 #include "../../network/tcpip/tcpip.h"
+#include "../input/input.h"
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
@@ -797,6 +798,44 @@ struct lisp_object* kernel_vfs_write_fd(struct lisp_object* fd, struct lisp_obje
     
     if (file && str) {
         size_t written = lfsx_write(file, str, strlen(str));
+        return lisp_create_integer(written);
+    }
+    return lisp_create_integer(-1);
+}
+
+/* --- Input Subsystem --- */
+
+/* Read Input (Blocking) */
+struct lisp_object* kernel_read_input(void) {
+    input_event_t ev;
+    /* Block until input */
+    if (input_pop_event(&ev, true)) {
+        struct lisp_object* type = lisp_create_integer(ev.type);
+        struct lisp_object* code = lisp_create_integer(ev.code);
+        struct lisp_object* val  = lisp_create_integer(ev.value);
+        
+        /* Return (type code value) */
+        return lisp_create_cons(type,
+               lisp_create_cons(code,
+               lisp_create_cons(val, lisp_nil())));
+    }
+    return lisp_nil(); /* Should not happen if blocking */
+}
+
+/* Poll Input (Non-Blocking) */
+struct lisp_object* kernel_poll_input(void) {
+    input_event_t ev;
+    if (input_pop_event(&ev, false)) {
+        struct lisp_object* type = lisp_create_integer(ev.type);
+        struct lisp_object* code = lisp_create_integer(ev.code);
+        struct lisp_object* val  = lisp_create_integer(ev.value);
+        
+        return lisp_create_cons(type,
+               lisp_create_cons(code,
+               lisp_create_cons(val, lisp_nil())));
+    }
+    return lisp_nil();
+}
 
 struct lisp_object* kernel_vfs_mkdir(struct lisp_object* path) {
     return lisp_create_integer(-1);
@@ -829,8 +868,16 @@ struct lisp_object* kernel_proc_fork(void) {
 }
 
 struct lisp_object* kernel_proc_exec(struct lisp_object* path, struct lisp_object* args) {
-    /* Basic exec implementation */
-    return lisp_create_integer(0);
+    if (!path) return lisp_create_integer(-1);
+    
+    const char* path_str = lisp_to_string(path);
+    if (!path_str) return lisp_create_integer(-2);
+    
+    /* Call process_exec - does not return on success */
+    int result = process_exec(path_str, NULL, NULL);
+    
+    /* If we get here, exec failed */
+    return lisp_create_integer(result);
 }
 
 struct lisp_object* kernel_proc_exit(struct lisp_object* status) {

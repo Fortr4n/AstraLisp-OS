@@ -237,11 +237,70 @@ void thread_exit(void) {
         current_thread->state = THREAD_ZOMBIE;
     }
     
-    /* Wait for scheduler to switch us out */
-    /* Real impl would call scheduler_yield() here */
+    /* Yield to scheduler */
+    extern void schedule(void);
+    schedule();
+    
+    /* Should not return, but just in case */
     for (;;) {
-        /* PowerPC Yield / Low Power */
-        __asm__ volatile ("or 27,27,27"); /* yield priority */
-        /* Could also use 'wait' instruction if enabled */
+        __asm__ volatile ("or 27,27,27");
     }
+}
+
+/* Execute ELF binary - replaces current process image */
+#include "../fs/elf.h"
+#include "../mm/pmm.h"
+#include "../mm/vmm.h"
+
+#define USER_STACK_TOP    0x7FFFFFFFE000ULL
+#define USER_STACK_SIZE   (64 * 1024)  /* 64KB user stack */
+#define PAGE_SIZE         4096
+
+extern void enter_user_mode(uintptr_t entry, uintptr_t user_sp);
+
+int process_exec(const char* path, char** argv, char** envp) {
+    (void)argv; (void)envp; /* TODO: Copy args to user stack */
+    
+    struct process* proc = process_get_current();
+    if (!proc) {
+        /* No current process, create one */
+        proc = process_create();
+        if (!proc) return -1;
+    }
+    
+    /* Load ELF */
+    uintptr_t entry_point = 0;
+    int result = elf_load(proc, path, &entry_point);
+    if (result != 0) {
+        return result;
+    }
+    
+    /* Allocate User Stack */
+    uintptr_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+    uint32_t vmm_flags = 0x007; /* Present | Write | User */
+    
+    for (uintptr_t addr = stack_bottom; addr < USER_STACK_TOP; addr += PAGE_SIZE) {
+        uintptr_t frame = pmm_alloc();
+        if (!frame) return -10;
+        
+        if (vmm_map_page(proc->page_directory, addr, frame, vmm_flags) != 0) {
+            pmm_free(frame);
+            return -11;
+        }
+        
+        /* Zero stack page */
+        memset((void*)frame, 0, PAGE_SIZE);
+    }
+    
+    /* Setup stack pointer (leave some space for argc/argv/envp) */
+    uintptr_t user_sp = USER_STACK_TOP - 16; /* 16-byte aligned */
+    
+    /* Switch to process page directory */
+    vmm_switch_pagedir(proc->page_directory);
+    
+    /* Jump to user mode - does not return */
+    enter_user_mode(entry_point, user_sp);
+    
+    /* Should never reach here */
+    return -99;
 }

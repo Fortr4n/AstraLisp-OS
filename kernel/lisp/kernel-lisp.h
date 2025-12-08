@@ -42,6 +42,9 @@ struct lisp_object* kernel_write_device(struct lisp_object* device, struct lisp_
 struct lisp_object* kernel_register_interrupt(struct lisp_object* irq, struct lisp_object* handler);
 struct lisp_object* kernel_unregister_interrupt(struct lisp_object* irq);
 
+struct lisp_object* kernel_read_input(void);
+struct lisp_object* kernel_poll_input(void);
+
 /* Initialize kernel Lisp interface */
 int kernel_lisp_init(void);
 

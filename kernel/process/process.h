@@ -104,4 +104,7 @@ struct process* process_get_current(void);
 /* Get current thread */
 struct thread* thread_get_current(void);
 
+/* Execute ELF binary */
+int process_exec(const char* path, char** argv, char** envp);
+
 #endif /* PROCESS_H */

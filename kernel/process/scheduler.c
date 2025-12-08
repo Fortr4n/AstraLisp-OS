@@ -196,8 +196,10 @@ void scheduler_yield(void) {
     spinlock_release(&cpu->lock);
     
     if (prev != next) {
-        context_switch(&prev->context, &next->context);
+        extern void switch_to(struct thread* prev, struct thread* next);
+        switch_to(prev, next);
     }
+}
 }
 
 static struct thread* sleeping_threads = NULL;

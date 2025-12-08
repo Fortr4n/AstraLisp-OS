@@ -47,16 +47,53 @@ extern int vmm_map_page(void* pagedir, uintptr_t virt, uintptr_t phys, uint32_t 
 #define PTE_COW         0x0000000000000200ULL
 
 /* Page Fault Handler */
-void handle_page_fault(uint32_t trap_num, uint64_t error_code, uint64_t addr) {
-    /* PowerPC DSI: trap=0x300. DSISR in error_code (passed by asm wrapper?) */
-    /* x86: trap=14. error_code has flags. */
+#include "regs.h"
+
+/* Page Fault Handler */
+void handle_page_fault(struct pt_regs* regs) {
+    uint64_t addr = regs->dar;
+    uint64_t error_code = regs->dsisr;
+    uint32_t trap_num = 0x300;
     
-    /* Let's assume generic interface: trap_num, error_code, addr */
+    /* ... Logic ... */
+    bool is_write = (error_code & 0x02000000) != 0;
     
-    if (trap_num == 0x300) { /* Data Storage Interrupt */
-        /* Check if it is a write fault */
-        /* DSISR bit 38 (0x02000000) is Store operation */
-        bool is_write = (error_code & 0x02000000) != 0;
+    if (is_write) {
+         extern int vmm_handle_cow(uintptr_t virt);
+         if (vmm_handle_cow(addr) == 0) return;
+    }
+    
+    /* Panic */
+    const char* name = get_trap_name(trap_num);
+    early_printf("\n!!! PAGE FAULT: %s (0x%x) at 0x%lx err=0x%lx !!!\n", name, trap_num, addr, error_code);
+    early_printf("NIP: %lx MSR: %lx\n", regs->nip, regs->msr);
+    for(;;);
+}
+
+void handle_exception_ex(struct pt_regs* regs) {
+    uint32_t trap_num = regs->trap;
+    
+    if (trap_num == 0x300) {
+        handle_page_fault(regs);
+        return;
+    }
+    
+    if (trap_num == 0x500) {
+        /* External Interrupt */
+        /* TODO: Dispatch XIVE */
+        return; 
+    }
+
+    const char* name = get_trap_name(trap_num);
+    early_printf("\n!!! EXCEPTION: %s (0x%x) !!!\n", name, trap_num);
+    early_printf("NIP: %lx MSR: %lx\n", regs->nip, regs->msr);
+    for (;;) { __asm__ volatile ("nop"); }
+}
+
+/* Backward compat stub if needed */
+void handle_exception(uint32_t t) { (void)t; }
+/* Backward compat for existing caller (handle_exception) */
+/* void handle_exception(uint32_t trap_num) { } - Removed */
         
         if (is_write) {
             /* Check if it's CoW */
