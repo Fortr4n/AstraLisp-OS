@@ -4,7 +4,7 @@
 
 AstraLisp OS is a next-generation operating system built around one core idea:
 
-> **The entire system is written in Lisp — from the kernel to the userland — with only a minimal layer of performance-critical assembly.**
+> **The most of system is written in Lisp — from the kernel to the userland — with only a minimal layer of performance-critical assembly.**
 
 Inspired by MIT’s and Symbolics’ Lisp Machines, AstraLisp OS reimagines what a fully homoiconic, introspective, self-extending system looks like on modern hardware. This is *not* a hobbyist toy. It’s a full OS with a modern architecture, hybrid kernel, JIT-driven performance model, and deep AI-native integration.
 
