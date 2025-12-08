@@ -9,7 +9,9 @@
 #include "../mm/vmm.h"
 #include "../hal/serial.h"
 #include "../mm/heap.h"
+#include "../sync/spinlock.h"
 #include "../../filesystem/lfsx/lfsx.h"
+#include "../driver/storage.h"
 #include "../../network/tcpip/tcpip.h"
 #include <stddef.h>
 #include <string.h>
@@ -82,10 +84,26 @@ struct lisp_object* kernel_get_memory_info(void) {
 
 /* Get CPU info */
 struct lisp_object* kernel_get_cpu_info(void) {
-    /* Placeholder - would get real CPU info */
-    struct lisp_object* info = lisp_create_object(LISP_CONS);
-    struct lisp_object* arch = lisp_create_cons(lisp_create_symbol("arch"), lisp_create_string("PowerISA", 7));
-    info = lisp_create_cons(arch, lisp_nil());
+    /* Read Processor Version Register (PVR) */
+    uint64_t pvr;
+    __asm__ volatile ("mfspr %0, 287" : "=r"(pvr)); /* SPR 287 = PVR */
+    
+    uint32_t version = (pvr >> 16) & 0xFFFF;
+    uint32_t revision = pvr & 0xFFFF;
+    
+    /* Read Processor ID Register (PIR) */
+    uint64_t pir;
+    __asm__ volatile ("mfspr %0, 1023" : "=r"(pir)); /* SPR 1023 = PIR */
+    
+    struct lisp_object* arch = lisp_create_cons(lisp_create_symbol("arch"), lisp_create_string("PowerISA-v3.1", 13));
+    struct lisp_object* ver = lisp_create_cons(lisp_create_symbol("version"), lisp_create_integer(version));
+    struct lisp_object* rev = lisp_create_cons(lisp_create_symbol("revision"), lisp_create_integer(revision));
+    struct lisp_object* cpu = lisp_create_cons(lisp_create_symbol("pir"), lisp_create_integer(pir));
+    
+    struct lisp_object* info = lisp_create_cons(arch, 
+                                lisp_create_cons(ver,
+                                lisp_create_cons(rev,
+                                lisp_create_cons(cpu, lisp_nil()))));
     return info;
 }
 
@@ -252,8 +270,21 @@ struct lisp_object* kernel_inspect_memory(struct lisp_object* addr) {
 
 /* Get kernel stats */
 struct lisp_object* kernel_get_stats(void) {
-    struct lisp_object* stats = lisp_create_object(LISP_CONS);
-    /* Placeholder */
+    extern uint32_t nr_cpus_online;
+    extern uint32_t nr_cpus_present;
+    
+    size_t free_mem = pmm_get_free_count() * 4096;
+    size_t used_mem = pmm_get_used_count() * 4096;
+    
+    struct lisp_object* mem_free = lisp_create_cons(lisp_create_symbol("memory-free"), lisp_create_integer(free_mem));
+    struct lisp_object* mem_used = lisp_create_cons(lisp_create_symbol("memory-used"), lisp_create_integer(used_mem));
+    struct lisp_object* cpus = lisp_create_cons(lisp_create_symbol("cpus-online"), lisp_create_integer(nr_cpus_online));
+    struct lisp_object* cpus_p = lisp_create_cons(lisp_create_symbol("cpus-present"), lisp_create_integer(nr_cpus_present));
+    
+    struct lisp_object* stats = lisp_create_cons(mem_free,
+                                 lisp_create_cons(mem_used,
+                                 lisp_create_cons(cpus,
+                                 lisp_create_cons(cpus_p, lisp_nil()))));
     return stats;
 }
 
@@ -322,8 +353,19 @@ struct lisp_object* kernel_spawn_thread(struct lisp_object* func) {
         return NULL;
     }
     
-    /* Placeholder - would create thread with Lisp function */
-    return lisp_create_integer(1);
+    extern struct process* current_process;
+    if (!current_process) {
+        return lisp_nil();
+    }
+    
+    /* Create thread with wrapper that will evaluate the Lisp function */
+    /* Note: Real impl needs a trampoline that stores func and calls runtime_eval */
+    struct thread* thr = thread_create(current_process, NULL);
+    if (thr) {
+        return lisp_create_integer(thr->tid);
+    }
+    
+    return lisp_nil();
 }
 
 /* Thread join */
@@ -334,19 +376,45 @@ struct lisp_object* kernel_thread_join(struct lisp_object* thread) {
 
 /* Mutex create */
 struct lisp_object* kernel_mutex_create(void) {
-    /* Placeholder */
-    return lisp_create_integer(1);
+    spinlock_t* lock = (spinlock_t*)kmalloc(sizeof(spinlock_t));
+    if (lock) {
+        spinlock_init(lock);
+        return lisp_create_integer((int64_t)(uintptr_t)lock);
+    }
+    return lisp_nil();
 }
 
 /* Mutex lock */
 struct lisp_object* kernel_mutex_lock(struct lisp_object* mutex) {
-    /* Placeholder */
+    if (!mutex) {
+        return lisp_nil();
+    }
+    
+    uintptr_t lock_addr = (uintptr_t)lisp_to_int(mutex);
+    spinlock_t* lock = (spinlock_t*)lock_addr;
+    
+    if (lock) {
+        spinlock_acquire(lock);
+        return lisp_create_integer(1);
+    }
+    
     return lisp_nil();
 }
 
 /* Mutex unlock */
 struct lisp_object* kernel_mutex_unlock(struct lisp_object* mutex) {
-    /* Placeholder */
+    if (!mutex) {
+        return lisp_nil();
+    }
+    
+    uintptr_t lock_addr = (uintptr_t)lisp_to_int(mutex);
+    spinlock_t* lock = (spinlock_t*)lock_addr;
+    
+    if (lock) {
+        spinlock_release(lock);
+        return lisp_create_integer(1);
+    }
+    
     return lisp_nil();
 }
 
@@ -364,14 +432,63 @@ struct lisp_object* kernel_receive_message(struct lisp_object* timeout) {
 
 /* Read device */
 struct lisp_object* kernel_read_device(struct lisp_object* device, struct lisp_object* offset, struct lisp_object* size) {
-    /* Placeholder */
+    if (!device || !offset || !size) {
+        return lisp_nil();
+    }
+    
+    const char* dev_name = lisp_to_string(device);
+    uint64_t off = (uint64_t)lisp_to_int(offset);
+    size_t sz = (size_t)lisp_to_int(size);
+    
+    if (!dev_name || sz == 0 || sz > 4096) {
+        return lisp_nil();
+    }
+    
+    struct block_device* blk = storage_find_device(dev_name);
+    if (!blk) {
+        return lisp_nil();
+    }
+    
+    uint8_t* buffer = (uint8_t*)kmalloc(sz);
+    if (!buffer) {
+        return lisp_nil();
+    }
+    
+    if (storage_read(blk, off, buffer, sz) == 0) {
+        struct lisp_object* result = lisp_create_string((const char*)buffer, sz);
+        kfree(buffer);
+        return result;
+    }
+    
+    kfree(buffer);
     return lisp_nil();
 }
 
 /* Write device */
 struct lisp_object* kernel_write_device(struct lisp_object* device, struct lisp_object* offset, struct lisp_object* data) {
-    /* Placeholder */
-    return lisp_create_integer(1);
+    if (!device || !offset || !data) {
+        return lisp_nil();
+    }
+    
+    const char* dev_name = lisp_to_string(device);
+    uint64_t off = (uint64_t)lisp_to_int(offset);
+    const char* data_str = lisp_to_string(data);
+    
+    if (!dev_name || !data_str) {
+        return lisp_nil();
+    }
+    
+    size_t sz = strlen(data_str);
+    struct block_device* blk = storage_find_device(dev_name);
+    if (!blk) {
+        return lisp_nil();
+    }
+    
+    if (storage_write(blk, off, data_str, sz) == 0) {
+        return lisp_create_integer(sz);
+    }
+    
+    return lisp_nil();
 }
 
 /* Register interrupt */

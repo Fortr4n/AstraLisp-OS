@@ -75,12 +75,36 @@ int socket_listen(struct socket* sock, int backlog) {
 
 /* Accept connection */
 struct socket* socket_accept(struct socket* sock) {
-    if (!sock) {
+    if (!sock || sock->state != 1) { /* Must be in LISTEN state */
         return NULL;
     }
     
-    /* Placeholder */
-    return NULL;
+    /* In a real implementation, this would block waiting for incoming connections */
+    /* For now, check if there's a pending connection in the backlog queue */
+    struct tcp_connection* pending = tcp_get_pending_connection(sock->local_port);
+    if (!pending) {
+        return NULL; /* No pending connections */
+    }
+    
+    /* Create new socket for the accepted connection */
+    struct socket* new_sock = (struct socket*)kmalloc(sizeof(struct socket));
+    if (!new_sock) {
+        return NULL;
+    }
+    
+    memset(new_sock, 0, sizeof(struct socket));
+    new_sock->fd = next_fd++;
+    new_sock->local_addr = sock->local_addr;
+    new_sock->local_port = sock->local_port;
+    new_sock->remote_addr = pending->remote_addr;
+    new_sock->remote_port = pending->remote_port;
+    new_sock->state = 2; /* ESTABLISHED */
+    new_sock->tcp_conn = pending;
+    
+    /* Complete the handshake - send SYN-ACK was done, now mark as established */
+    pending->state = TCP_ESTABLISHED;
+    
+    return new_sock;
 }
 
 /* Connect socket */
