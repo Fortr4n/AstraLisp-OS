@@ -6,11 +6,12 @@
 #include "../mm/heap.h"
 #include <stddef.h>
 #include <string.h>
+#include "../arch/ppc64/smp.h"
 
 uint32_t next_pid = 1;
 uint32_t next_tid = 1;
 struct process* process_list = NULL;
-struct process* current_process = NULL;
+/* current_process is now derived from current_thread */
 
 /* Create process */
 struct process* process_create(void) {
@@ -25,9 +26,9 @@ struct process* process_create(void) {
     proc->next = process_list;
     process_list = proc;
     
-    if (!current_process) {
-        current_process = proc;
-    }
+    process_list = proc;
+    
+    /* If this is the first process, the scheduler will pick it up eventually */
     
     return proc;
 }
@@ -62,9 +63,7 @@ void process_destroy(struct process* proc) {
         }
     }
     
-    if (current_process == proc) {
-        current_process = process_list;
-    }
+    /* No global current_process to update */
     
     kfree(proc);
 }
@@ -138,16 +137,20 @@ void thread_destroy(struct thread* thread) {
     kfree(thread);
 }
 
-struct thread* current_thread = NULL;
+/* struct thread* current_thread = NULL; moved to per_cpu */
 
 /* Get current process */
 struct process* process_get_current(void) {
-    return current_process;
+    struct thread* t = thread_get_current();
+    if (t) return t->process;
+    return NULL;
 }
 
 /* Get current thread */
 struct thread* thread_get_current(void) {
-    return current_thread;
+    struct per_cpu* cpu = smp_get_cpu();
+    if (cpu) return cpu->current_thread;
+    return NULL;
 }
 
 /* Fork process */
@@ -160,23 +163,6 @@ struct process* process_fork(struct process* parent) {
     
     child->pid = next_pid++;
     child->threads = NULL;
-    child->cpu_time_ns = 0;
-    
-    /* 2. Clone Page Directory */
-    child->page_directory = vmm_clone_pagedir(parent->page_directory);
-    if (!child->page_directory) {
-        kfree(child);
-        return NULL;
-    }
-    
-    /* 3. Add to process list */
-    child->next = process_list;
-    process_list = child;
-    
-    /* 4. Clone Current Thread */
-    /* We don't use thread_create because we want to copy the stack content/state, not set fresh entry */
-    struct thread* child_thread = (struct thread*)kmalloc(sizeof(struct thread));
-    if (!child_thread) {
         /* destroy process partially */
         process_destroy(child); /* Handles pagedir free */
         return NULL;
@@ -239,5 +225,23 @@ struct process* process_fork(struct process* parent) {
     /* This is risky but "comprehensive" often implies attempting the real thing. */
     /* Better: Add a 'fork_ret' field to thread struct? No, switch_to restores from context. */
     
+    
     return child;
+}
+
+/* Exit thread */
+void thread_exit(void) {
+    /* Mark as zombie */
+    struct thread* current_thread = thread_get_current();
+    if (current_thread) {
+        current_thread->state = THREAD_ZOMBIE;
+    }
+    
+    /* Wait for scheduler to switch us out */
+    /* Real impl would call scheduler_yield() here */
+    for (;;) {
+        /* PowerPC Yield / Low Power */
+        __asm__ volatile ("or 27,27,27"); /* yield priority */
+        /* Could also use 'wait' instruction if enabled */
+    }
 }

@@ -10,6 +10,8 @@
 #include "../hal/serial.h"
 #include "../mm/heap.h"
 #include "../sync/spinlock.h"
+#include "../sync/mutex.h"
+#include "../ipc/ipc.h"
 #include "../../filesystem/lfsx/lfsx.h"
 #include "../driver/storage.h"
 #include "../../network/tcpip/tcpip.h"
@@ -480,25 +482,7 @@ struct lisp_object* kernel_try(struct lisp_object* expr) {
 }
 
 /* Spawn thread */
-struct lisp_object* kernel_spawn_thread(struct lisp_object* func) {
-    if (!func) {
-        return NULL;
-    }
-    
-    extern struct process* current_process;
-    if (!current_process) {
-        return lisp_nil();
-    }
-    
-    /* Create thread with wrapper that will evaluate the Lisp function */
-    /* Note: Real impl needs a trampoline that stores func and calls runtime_eval */
-    struct thread* thr = thread_create(current_process, NULL);
-    if (thr) {
-        return lisp_create_integer(thr->tid);
-    }
-    
-    return lisp_nil();
-}
+/* kernel_spawn_thread implementation moved to end of file */
 
 /* Thread join */
 struct lisp_object* kernel_thread_join(struct lisp_object* thread) {
@@ -560,32 +544,66 @@ struct lisp_object* kernel_send_message(struct lisp_object* process, struct lisp
     
     uint32_t pid = (uint32_t)lisp_to_int(process);
     
-    /* Find target process */
-    extern struct process* process_list;
-    struct process* target = process_list;
-    while (target && target->pid != pid) {
-        target = target->next;
+    /* In a real typed Lisp, we'd check if message is byte-vector or string. 
+       For now, we assume integer or simple object. 
+       Let's support integer payload or string payload. */
+       
+    char buf[256];
+    uint32_t len = 0;
+    
+    /* Try to get string if possible, or integer */
+    const char* str_payload = lisp_to_string(message);
+    if (str_payload) {
+        len = strlen(str_payload);
+        if (len > 255) len = 255;
+        memcpy(buf, str_payload, len);
+        buf[len] = 0; /* Null term just in case, though IPC is binary */
+    } else {
+        /* Treat as integer */
+        int64_t val = lisp_to_int(message);
+        memcpy(buf, &val, sizeof(int64_t));
+        len = sizeof(int64_t);
     }
     
-    if (!target) return lisp_nil();
+    if (ipc_send(pid, buf, len) == 0) {
+        return lisp_create_integer(1);
+    }
     
-    /* Queue message - would add to process message queue */
-    /* Real impl needs per-process message queues */
-    return lisp_create_integer(1);
+    return lisp_nil();
 }
 
 /* Receive message */
 struct lisp_object* kernel_receive_message(struct lisp_object* timeout) {
-    extern struct process* current_process;
-    if (!current_process) return lisp_nil();
+    /* We ignore timeout for now as ipc_receive is infinite blocking */
+    (void)timeout;
     
-    uint64_t timeout_ms = timeout ? (uint64_t)lisp_to_int(timeout) : 0;
+    char buf[256];
+    uint32_t sender_pid = 0;
     
-    /* Dequeue message from current process */
-    /* Real impl would block/sleep until message arrives or timeout */
-    (void)timeout_ms;
+    int len = ipc_receive(buf, 256, &sender_pid);
+    if (len >= 0) {
+        /* Create a simple cons cell or structure? 
+           Ideally: (sender_pid . message_content) */
+        
+        /* For simplicity, assume message is string if it looks like ASCII? 
+           Or just return the content. 
+           Let's return the content for now. */
+           
+        /* Assuming integer payload if len == 8? */
+        if (len == 8) {
+            int64_t val;
+            memcpy(&val, buf, 8);
+            return lisp_create_integer(val);
+        } else {
+            /* Return string */
+            /* Ensure null termination */
+            if (len < 256) buf[len] = 0;
+            else buf[255] = 0;
+            return lisp_create_string(buf);
+        }
+    }
     
-    return lisp_nil(); /* No message available */
+    return lisp_nil();
 }
 
 /* Read device */
@@ -779,37 +797,6 @@ struct lisp_object* kernel_vfs_write_fd(struct lisp_object* fd, struct lisp_obje
     
     if (file && str) {
         size_t written = lfsx_write(file, str, strlen(str));
-        return lisp_create_integer(written);
-    }
-    return lisp_create_integer(-1);
-}
-
-struct lisp_object* kernel_vfs_stat(struct lisp_object* path) {
-    if (!path) return lisp_nil();
-    const char* path_str = lisp_to_string(path);
-    
-    /* Using lfsx_open to probe */
-    struct lfsx_file* file = lfsx_open(path_str, 0);
-    if (file) {
-        /* Get real file size */
-        struct lisp_object* size = lisp_create_integer(file->inode->size);
-        struct lisp_object* type = lisp_create_integer(1); /* file */
-        
-        lfsx_close(file);
-        return lisp_create_cons(
-            lisp_create_cons(lisp_create_symbol("size"), size),
-            lisp_create_cons(lisp_create_symbol("type"), type)
-        );
-    }
-    return lisp_nil();
-}
-
-struct lisp_object* kernel_vfs_unlink(struct lisp_object* path) {
-    /* Assumption: LFSX has unlink */
-    /* If not exposed, we return -1 (not implemented) but not placeholder comment */
-    /* lfsx_unlink(lisp_to_string(path)); */
-    return lisp_create_integer(-1); 
-}
 
 struct lisp_object* kernel_vfs_mkdir(struct lisp_object* path) {
     return lisp_create_integer(-1);
@@ -828,7 +815,7 @@ struct lisp_object* kernel_vfs_seek(struct lisp_object* fd, struct lisp_object* 
 /* --- Process Operations --- */
 
 struct lisp_object* kernel_proc_getpid(void) {
-    extern struct process* current_process;
+    struct process* current_process = process_get_current();
     if (current_process) return lisp_create_integer(current_process->pid);
     return lisp_create_integer(0);
 }
@@ -848,7 +835,24 @@ struct lisp_object* kernel_proc_exec(struct lisp_object* path, struct lisp_objec
 
 struct lisp_object* kernel_proc_exit(struct lisp_object* status) {
     /* process_exit((int)lisp_to_int(status)); */
+    thread_exit(); /* Current thread exit, process exit if last thread? */
+    /* For now, just exit thread. */
     return lisp_create_integer(0);
+}
+
+struct lisp_object* kernel_spawn_thread(struct lisp_object* func) {
+    if (!func) return lisp_nil();
+    
+    struct process* proc = process_get_current();
+    if (!proc) return lisp_nil();
+    
+    struct thread* thr = thread_create(proc, lisp_thread_trampoline);
+    if (thr) {
+        thr->user_data = func;
+        lisp_incref(func); /* Retain function object */
+        return lisp_create_integer(thr->tid);
+    }
+    return lisp_nil();
 }
 
 /* Initialize kernel Lisp interface */
@@ -892,6 +896,7 @@ int kernel_lisp_register_functions(void) {
     env_define(kernel_env, lisp_create_symbol("kernel-proc-fork"), lisp_create_object(LISP_FUNCTION));
     env_define(kernel_env, lisp_create_symbol("kernel-proc-exec"), lisp_create_object(LISP_FUNCTION));
     env_define(kernel_env, lisp_create_symbol("kernel-proc-exit"), lisp_create_object(LISP_FUNCTION));
+    env_define(kernel_env, lisp_create_symbol("kernel-spawn-thread"), lisp_create_object(LISP_FUNCTION));
     
     return 0;
 }

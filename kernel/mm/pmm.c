@@ -22,7 +22,12 @@ static size_t frame_bitmap_size = 0;
 static size_t total_frames = 0;
 static size_t used_frames = 0;
 static size_t reserved_frames = 0;
+static size_t reserved_frames = 0;
 static uintptr_t highest_address = 0;
+
+/* Refcounts array */
+static uint8_t* frame_refcounts = NULL;
+
 
 static spinlock_t pmm_lock;
 
@@ -107,7 +112,13 @@ int pmm_init(void* multiboot_info_ptr) {
     if (highest_address == 0) return -1;
 
     total_frames = highest_address / PAGE_SIZE;
+    total_frames = highest_address / PAGE_SIZE;
     frame_bitmap_size = align_up(total_frames / FRAMES_PER_BYTE, PAGE_SIZE);
+    size_t refcounts_size = align_up(total_frames * sizeof(uint8_t), PAGE_SIZE);
+    
+    /* Allocate Bitmap AND Refcounts (contiguous if possible) */
+    size_t total_meta_size = frame_bitmap_size + refcounts_size;
+
 
     /* Allocate Bitmap */
     uintptr_t bitmap_phys = 0;
@@ -121,7 +132,7 @@ int pmm_init(void* multiboot_info_ptr) {
     for (int i = 0; i < region_count; i++) {
         if (regions[i].type == MULTIBOOT_MEMORY_AVAILABLE) {
             /* Check if region is large enough */
-            if (regions[i].length >= frame_bitmap_size) {
+            if (regions[i].length >= total_meta_size) {
                 uintptr_t r_start = regions[i].base;
                 uintptr_t r_end = regions[i].base + regions[i].length;
                 
@@ -142,10 +153,14 @@ int pmm_init(void* multiboot_info_ptr) {
 
     if (bitmap_phys == 0) return -1;
 
+    if (bitmap_phys == 0) return -1;
+
     frame_bitmap = (uint8_t*)P2V(bitmap_phys);
+    frame_refcounts = (uint8_t*)P2V(bitmap_phys + frame_bitmap_size);
     
     /* init logic */
     memset(frame_bitmap, 0xFF, frame_bitmap_size); /* Mark all used */
+    memset(frame_refcounts, 1, total_frames); /* Default to 1 ref for used pages */
     used_frames = total_frames;
     
     /* Free available regions */
@@ -155,8 +170,11 @@ int pmm_init(void* multiboot_info_ptr) {
             uintptr_t end = align_down(regions[i].base + regions[i].length, PAGE_SIZE) / PAGE_SIZE;
             for (uintptr_t f = start; f < end; f++) {
                 if (f < total_frames) { /* Boundary check */
+                if (f < total_frames) { /* Boundary check */
                     clear_frame(f);
+                    frame_refcounts[f] = 0;
                     used_frames--;
+                }
                 }
             }
         }
@@ -164,7 +182,9 @@ int pmm_init(void* multiboot_info_ptr) {
     
     /* Mark bitmap as used */
     uintptr_t b_start = bitmap_phys / PAGE_SIZE;
-    uintptr_t b_end = (bitmap_phys + frame_bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    /* Mark metadata as used */
+    uintptr_t b_start = bitmap_phys / PAGE_SIZE;
+    uintptr_t b_end = (bitmap_phys + total_meta_size + PAGE_SIZE - 1) / PAGE_SIZE;
     for (uintptr_t f = b_start; f < b_end; f++) {
         if (!test_frame(f)) {
              set_frame(f);
@@ -194,6 +214,7 @@ void* pmm_alloc(void) {
         if (!test_frame(i)) {
             set_frame(i);
             used_frames++;
+            frame_refcounts[i] = 1;
             last_search = i + 1;
             spinlock_release(&pmm_lock);
             return (void*)(i * PAGE_SIZE);
@@ -205,6 +226,7 @@ void* pmm_alloc(void) {
             if (!test_frame(i)) {
                 set_frame(i);
                 used_frames++;
+                frame_refcounts[i] = 1;
                 last_search = i + 1;
                 spinlock_release(&pmm_lock);
                 return (void*)(i * PAGE_SIZE);
@@ -221,10 +243,43 @@ void pmm_free(void* frame) {
     spinlock_acquire(&pmm_lock);
     uintptr_t f = (uintptr_t)frame / PAGE_SIZE;
     if (f < total_frames && test_frame(f)) {
-        clear_frame(f);
-        used_frames--;
+        /* Decrement refcount */
+        if (frame_refcounts[f] > 0) {
+            frame_refcounts[f]--;
+        }
+        
+        /* Only free if refcount is 0 */
+        if (frame_refcounts[f] == 0) {
+            clear_frame(f);
+            used_frames--;
+        }
     }
     spinlock_release(&pmm_lock);
+}
+
+void pmm_inc_ref(uintptr_t phys) {
+    uintptr_t f = phys / PAGE_SIZE;
+    if (f < total_frames) {
+        spinlock_acquire(&pmm_lock);
+        if (frame_refcounts[f] < 255) {
+            frame_refcounts[f]++;
+        }
+        spinlock_release(&pmm_lock);
+    }
+}
+
+int pmm_dec_ref(uintptr_t phys) {
+    int ref = 0;
+    uintptr_t f = phys / PAGE_SIZE;
+    if (f < total_frames) {
+        spinlock_acquire(&pmm_lock);
+        if (frame_refcounts[f] > 0) {
+            frame_refcounts[f]--;
+        }
+        ref = frame_refcounts[f];
+        spinlock_release(&pmm_lock);
+    }
+    return ref;
 }
 
 void* pmm_alloc_multiple(size_t pages) {
@@ -245,8 +300,11 @@ void* pmm_alloc_multiple(size_t pages) {
             }
             if (found) {
                 for (size_t j = 0; j < pages; j++) {
+                for (size_t j = 0; j < pages; j++) {
                     set_frame(i + j);
+                    frame_refcounts[i + j] = 1;
                     used_frames++;
+                }
                 }
                 spinlock_release(&pmm_lock);
                 return (void*)(i * PAGE_SIZE);

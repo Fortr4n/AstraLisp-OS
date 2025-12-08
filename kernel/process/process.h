@@ -8,11 +8,30 @@
 #include <stdbool.h>
 
 /* Process structure */
+#include "../sync/mutex.h"
+#include "../sync/wait_queue.h"
+
+/* IPC Message */
+struct message {
+    uint32_t sender_pid;
+    uint32_t length;
+    uint8_t data[256];
+    struct message* next;
+};
+
+/* Process structure */
 struct process {
     uint32_t pid;
     void* page_directory;
     struct thread* threads;
-    uint64_t cpu_time_ns;  /* Total CPU time */
+    uint64_t cpu_time_ns;
+    
+    /* IPC */
+    struct message* msg_queue_head;
+    struct message* msg_queue_tail;
+    mutex_t msg_lock;
+    wait_queue_t msg_wait;
+    
     struct process* next;
 };
 
@@ -55,8 +74,9 @@ struct thread {
 
 /* Global process list (for Lisp introspection) */
 extern struct process* process_list;
-extern struct process* current_process;
-extern struct thread* current_thread;
+/* Globals removed for SMP */
+/* extern struct process* current_process; */
+/* extern struct thread* current_thread; */
 extern uint32_t next_pid;
 extern uint32_t next_tid;
 

@@ -8,6 +8,7 @@
 #include "mm/heap.h"
 #include "multiboot2.h"
 #include "arch/ppc64/smp.h"
+#include "process/scheduler.h"
 #include "../runtime/lisp/gc.h"      /* Lisp Headers */
 #include "../runtime/lisp/evaluator.h"
 #include "../runtime/lisp/reader.h"
@@ -92,6 +93,9 @@ void kernel_main(uint64_t magic, void* addr) {
             opal_puts("\n");
         }
     }
+    
+    /* Initialize Scheduler */
+    scheduler_init();
     
     /* Initialize Lisp Runtime */
     if (fdt_ptr) opal_puts("Initializing AstraLisp Runtime...\n");

@@ -23,7 +23,12 @@ void* pmm_alloc_multiple(size_t pages);
 size_t pmm_get_free_count(void);
 
 /* Get number of used pages */
+/* Get number of used pages */
 size_t pmm_get_used_count(void);
+
+/* Reference Counting for CoW */
+void pmm_inc_ref(uintptr_t phys);
+int pmm_dec_ref(uintptr_t phys);
 
 #ifdef TEST_MODE
 #include <stdio.h>

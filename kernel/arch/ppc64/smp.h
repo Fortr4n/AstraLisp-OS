@@ -4,17 +4,11 @@
 #ifndef _KERNEL_ARCH_PPC64_SMP_H
 #define _KERNEL_ARCH_PPC64_SMP_H
 
-#include <stdint.h>
-#include <stdbool.h>
+#include "../../sync/spinlock.h"
+#include "../../process/scheduler.h"
 
-/* Maximum CPUs supported */
-#define NR_CPUS 256
-
-/* CPU States */
-#define CPU_STATE_OFFLINE   0
-#define CPU_STATE_STARTING  1
-#define CPU_STATE_ONLINE    2
-#define CPU_STATE_HALTED    3
+/* Forward declare struct thread */
+struct thread;
 
 /* Per-CPU Data Structure */
 struct per_cpu {
@@ -22,8 +16,14 @@ struct per_cpu {
     uint32_t pir;           /* Hardware PIR */
     uint32_t state;         /* CPU_STATE_xxx */
     void*    stack;         /* Boot stack pointer */
-    void*    current_thread;/* Currently running thread */
+    struct thread* current_thread; /* Currently running thread */
     uint64_t ticks;         /* Per-CPU tick counter */
+    
+    /* Scheduler Data */
+    struct thread* runqueues[MAX_PRIORITIES];
+    uint32_t runqueue_count;  /* Number of runnable threads */
+    struct thread* idle_thread;
+    spinlock_t lock;        /* Protects runqueues */
 };
 
 /* Global Per-CPU Array */

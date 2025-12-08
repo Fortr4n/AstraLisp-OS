@@ -5,7 +5,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdbool.h>
 
+#define MAX_PRIORITIES 5
+
+/* Initialize scheduler */
 /* Initialize scheduler */
 int scheduler_init(void);
 
@@ -26,5 +30,8 @@ void* scheduler_get_current_thread(void);
 
 /* Sleep for ticks */
 void scheduler_sleep(uint32_t ticks);
+
+/* Wake up a blocked thread */
+int scheduler_wake_thread(void* thread);
 
 #endif /* SCHEDULER_H */
