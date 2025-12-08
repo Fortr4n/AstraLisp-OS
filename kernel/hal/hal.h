@@ -44,6 +44,7 @@ int hal_suspend(void);
 int hal_resume(void);
 int hal_shutdown(void);
 int hal_reboot(void);
+uint64_t hal_get_rtc_time(void);
 
 #endif /* HAL_H */
 

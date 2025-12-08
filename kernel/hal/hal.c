@@ -208,4 +208,59 @@ int hal_reboot(void) {
     opal_cec_reboot();
     return 0;
 }
+/* Helper to convert BCD to binary */
+static uint32_t bcd2bin(uint32_t val) {
+    return ((val) & 0x0f) + ((val) >> 4) * 10;
+}
 
+/* Helper: Days in month */
+static int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+/* Check if leap year */
+static int is_leap(int year) {
+    return (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+}
+
+/* Get RTC time in nanoseconds */
+uint64_t hal_get_rtc_time(void) {
+    uint32_t ymd;
+    uint64_t hmsm;
+    
+    /* OPAL_RTC_READ = 3 */
+    int rc = opal_rtc_read(&ymd, &hmsm);
+    if (rc != 0) { /* OPAL_SUCCESS = 0 */
+        return 0;
+    }
+    
+    /* Decode OPAL format */
+    /* YMD: 000Y YYYY MMMM DDDD */
+    /* HMSM: HHHH MMMM SSSS MMMM MMMM MMMM MMMM */
+    
+    uint32_t year = bcd2bin((ymd >> 12) & 0xFFF) + 2000; /* Assume 2000+ */
+    uint32_t month = bcd2bin((ymd >> 8) & 0xF);
+    uint32_t day = bcd2bin(ymd & 0xFF);
+    
+    uint32_t hour = bcd2bin((hmsm >> 56) & 0xFF);
+    uint32_t minute = bcd2bin((hmsm >> 48) & 0xFF);
+    uint32_t second = bcd2bin((hmsm >> 40) & 0xFF);
+    /* Milliseconds ignored for now as they are high precision */
+    
+    /* Convert to unix timestamp (seconds since 1970) */
+    uint64_t days = 0;
+    for (uint32_t y = 1970; y < year; y++) {
+        days += is_leap(y) ? 366 : 365;
+    }
+    
+    for (uint32_t m = 1; m < month; m++) {
+        if (m == 2 && is_leap(year)) {
+            days += 29;
+        } else {
+            days += days_in_month[m];
+        }
+    }
+    
+    days += day - 1;
+    
+    uint64_t total_seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+    return total_seconds * 1000000000ULL;
+}

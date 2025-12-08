@@ -12,6 +12,7 @@ struct process {
     uint32_t pid;
     void* page_directory;
     struct thread* threads;
+    uint64_t cpu_time_ns;  /* Total CPU time */
     struct process* next;
 };
 
@@ -46,6 +47,7 @@ struct thread {
     uintptr_t stack_size;
     uint64_t sleep_until;
     uint64_t time_slice;
+    uint64_t cpu_time_ns;  /* CPU time consumed */
     struct thread* next;
     struct thread* prev;
 };

@@ -283,13 +283,25 @@
 
 (defun time-get-process-cputime ()
   "Get per-process CPU time."
-  ;; Placeholder - would track actual CPU time per process
-  (make-timespec :sec 0 :nsec 0))
+  (let ((time (kernel-get-process-cputime (get-current-pid))))
+    (make-timespec
+     :sec (floor time 1000000000)
+     :nsec (mod time 1000000000))))
 
 (defun time-get-thread-cputime ()
   "Get per-thread CPU time."
-  ;; Placeholder - would track actual CPU time per thread
-  (make-timespec :sec 0 :nsec 0))
+  (let ((time (kernel-get-thread-cputime (get-current-thread-id))))
+    (make-timespec
+     :sec (floor time 1000000000)
+     :nsec (mod time 1000000000))))
+
+;;; Timer Management
+
+(defun timer-create (clock type interval-ns callback &key data)
+;; ... (omitted shared logic if unchanged, but I must match TargetContent exactly for replace) ... 
+;; ... Wait, replace_file_content replaces a block. I will target specific stubs or use multi_replace.
+;; Using multi_replace is safer for scattered changes.
+
 
 ;;; Timer Management
 
@@ -631,7 +643,7 @@
 
 (defun scheduler-tick ()
   "Update scheduler accounting on tick."
-  nil)
+  (kernel-scheduler-update-accounting))
 
 (defun signal-send (pid sig)
   (declare (ignore pid sig))
@@ -658,6 +670,5 @@
 
 (defun get-rtc-time-ns ()
   "Get RTC time in nanoseconds since epoch."
-  ;; Would read from RTC hardware
-  0)
+  (kernel-get-rtc-time))
 
